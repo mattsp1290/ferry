@@ -48,6 +48,11 @@ impl RefMap {
         self.heads().next().is_some()
     }
 
+    /// Whether the branch `refs/heads/<branch>` exists.
+    pub fn has_head(&self, branch: &str) -> bool {
+        self.0.contains_key(&format!("{HEADS}{branch}"))
+    }
+
     /// Number of refs in the symmetric difference: refs created, moved, or
     /// deleted when going from `self` to `other`.
     pub fn diff_count(&self, other: &Self) -> usize {
@@ -134,7 +139,7 @@ pub fn parse_ls_remote(text: &str) -> RemoteState {
             refs.insert(name, oid);
         }
     }
-    let head = head_target.filter(|branch| refs.get(&format!("{HEADS}{branch}")).is_some());
+    let head = head_target.filter(|branch| refs.has_head(branch));
     RemoteState { refs, head }
 }
 

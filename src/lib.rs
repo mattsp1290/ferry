@@ -3,6 +3,7 @@
 //! The binary in `main.rs` is a thin dispatcher. Everything it does lives in
 //! these modules so that integration tests can drive the same code.
 
+pub mod app;
 pub mod cli;
 pub mod config;
 pub mod forge;

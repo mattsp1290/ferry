@@ -730,6 +730,7 @@ dependencies = [
  "cadence",
  "clap",
  "datadog-opentelemetry",
+ "fastrand",
  "nix 0.31.3",
  "opentelemetry",
  "opentelemetry_sdk",

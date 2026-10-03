@@ -19,6 +19,7 @@ axum = { version = "0.8", default-features = false, features = ["http1", "tokio"
 cadence = "1.8"
 clap = { version = "4.6", features = ["derive"] }
 datadog-opentelemetry = "0.5.2"
+fastrand = "2"
 nix = { version = "0.31", features = ["signal"] }
 # The OpenTelemetry versions follow datadog-opentelemetry, not "latest".
 # See AGENTS.md before bumping any of them.
