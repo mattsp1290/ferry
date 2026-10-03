@@ -8,7 +8,6 @@ mod support;
 
 use std::net::UdpSocket;
 use std::os::unix::net::UnixDatagram;
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use opentelemetry::Value;
@@ -21,10 +20,11 @@ use tracing_subscriber::layer::SubscriberExt;
 use ferry::config::RepoEntry;
 use ferry::sync::outcome::{ErrorKind, SyncOutcome, SyncResult};
 use ferry::telemetry::logging::dd_ids;
-use ferry::telemetry::metrics::{ConstTags, DogstatsdMetrics, DogstatsdTarget};
-use ferry::telemetry::tracing::{build_datadog_provider, mark_error, otel_layer, parse_agent_url};
-use ferry::telemetry::{LogFormat, Metrics, Settings, Telemetry};
-use support::capture::{Capture, attr, attr_str, json_dispatch, json_dispatch_at, memory_provider};
+use ferry::telemetry::tracing::{mark_error, otel_layer, parse_agent_url};
+use ferry::telemetry::{self, DogstatsdMetrics, DogstatsdTarget, LogFormat, Metrics, Settings};
+use support::capture::{
+    Capture, attr, attr_str, json_dispatch, json_dispatch_at, memory_provider, tags,
+};
 
 // ---------------------------------------------------------------------------
 // helpers
@@ -40,27 +40,34 @@ fn entry() -> RepoEntry {
     }
 }
 
-fn tags() -> ConstTags {
-    ConstTags {
-        service: "ferry".to_owned(),
-        env: Some("test".to_owned()),
-        version: "1.2.3".to_owned(),
-    }
-}
-
 const CONST_TAGS: &str = "service:ferry,env:test,version:1.2.3";
+
+/// Receives `count` datagrams through `recv`, which returns the byte count.
+fn recv_datagrams(
+    count: usize,
+    mut recv: impl FnMut(&mut [u8]) -> std::io::Result<usize>,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut buf = [0_u8; 2048];
+    for _ in 0..count {
+        let n = recv(&mut buf).expect("datagram arrives");
+        out.push(String::from_utf8(buf[..n].to_vec()).unwrap());
+    }
+    out
+}
 
 fn recv_datagrams_udp(socket: &UdpSocket, count: usize) -> Vec<String> {
     socket
         .set_read_timeout(Some(Duration::from_secs(5)))
         .unwrap();
-    let mut out = Vec::new();
-    let mut buf = [0_u8; 2048];
-    for _ in 0..count {
-        let (n, _) = socket.recv_from(&mut buf).expect("datagram arrives");
-        out.push(String::from_utf8(buf[..n].to_vec()).unwrap());
-    }
-    out
+    recv_datagrams(count, |buf| socket.recv_from(buf).map(|(n, _)| n))
+}
+
+/// A local UDP socket standing in for the Agent, and its `udp://` URL.
+fn udp_server() -> (UdpSocket, String) {
+    let server = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let url = format!("udp://127.0.0.1:{}", server.local_addr().unwrap().port());
+    (server, url)
 }
 
 // ---------------------------------------------------------------------------
@@ -123,9 +130,8 @@ fn settings_treat_empty_as_unset_and_bad_format_as_warning() {
 // ---------------------------------------------------------------------------
 
 fn udp_metrics(rotation: Duration) -> (DogstatsdMetrics, UdpSocket) {
-    let server = UdpSocket::bind("127.0.0.1:0").unwrap();
-    let port = server.local_addr().unwrap().port();
-    let target = DogstatsdTarget::parse(&format!("udp://127.0.0.1:{port}")).unwrap();
+    let (server, url) = udp_server();
+    let target = DogstatsdTarget::parse(&url).unwrap();
     let metrics = DogstatsdMetrics::connect_with_rotation(&target, &tags(), rotation).unwrap();
     (metrics, server)
 }
@@ -142,10 +148,7 @@ fn expected_datagrams() -> Vec<String> {
 }
 
 fn error_outcome() -> SyncOutcome {
-    let mut outcome = SyncOutcome::error(ErrorKind::Network, Duration::from_millis(1500));
-    outcome.refs_changed = 3;
-    outcome.refs_pruned = 1;
-    outcome
+    SyncOutcome::error(ErrorKind::Network, Duration::from_millis(1500)).with_refs(3, 1)
 }
 
 fn exercise_all_methods(metrics: &dyn Metrics) {
@@ -194,12 +197,8 @@ fn dogstatsd_udp_emits_every_trait_method() {
 
 #[test]
 fn dogstatsd_omits_env_tag_when_unset() {
-    let server = UdpSocket::bind("127.0.0.1:0").unwrap();
-    let target = DogstatsdTarget::parse(&format!(
-        "udp://127.0.0.1:{}",
-        server.local_addr().unwrap().port()
-    ))
-    .unwrap();
+    let (server, url) = udp_server();
+    let target = DogstatsdTarget::parse(&url).unwrap();
     let mut tags = tags();
     tags.env = None;
     let metrics = DogstatsdMetrics::connect(&target, &tags).unwrap();
@@ -224,12 +223,7 @@ fn dogstatsd_unix_datagram_socket() {
     exercise_all_methods(&metrics);
 
     let expected = expected_all_methods();
-    let mut buf = [0_u8; 2048];
-    let mut got = Vec::new();
-    for _ in 0..expected.len() {
-        let n = server.recv(&mut buf).expect("datagram arrives");
-        got.push(String::from_utf8(buf[..n].to_vec()).unwrap());
-    }
+    let got = recv_datagrams(expected.len(), |buf| server.recv(buf));
     assert_eq!(got, expected);
     assert_eq!(metrics.send_error_count(), 0);
 }
@@ -395,7 +389,7 @@ fn text_format_writes_plain_lines() {
         log_format: LogFormat::Text,
         ..Settings::default()
     };
-    let (_guard, dispatch) = Telemetry::build(settings, capture.clone());
+    let (_guard, dispatch) = telemetry::build(settings, capture.clone());
     with_default(&dispatch, || info!("plain text line"));
     let text = capture.text();
     assert!(text.contains("plain text line"));
@@ -409,7 +403,7 @@ fn log_level_filters_events() {
         log_level: "warn".to_owned(),
         ..Settings::default()
     };
-    let (_guard, dispatch) = Telemetry::build(settings, capture.clone());
+    let (_guard, dispatch) = telemetry::build(settings, capture.clone());
     with_default(&dispatch, || {
         info!("dropped");
         warn!("kept");
@@ -417,6 +411,59 @@ fn log_level_filters_events() {
     let lines = capture.json_lines();
     assert_eq!(lines.len(), 1);
     assert_eq!(lines[0]["message"], "kept");
+}
+
+/// Raising the log level must not strip the repository and the trace ID
+/// from the error lines that remain.
+#[test]
+fn error_lines_above_info_keep_span_fields_and_correlation_ids() {
+    let capture = Capture::default();
+    let (provider, exporter) = memory_provider();
+    let dispatch = json_dispatch_at(&capture, &provider, "warn");
+    with_default(&dispatch, || {
+        let span = info_span!("ferry.sync_repo", repo = "owner/alpha");
+        let _entered = span.enter();
+        info!("filtered out");
+        ::tracing::error!(error_kind = "network", "sync failed");
+    });
+
+    let lines = capture.json_lines();
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert_eq!(lines[0]["message"], "sync failed");
+    assert_eq!(lines[0]["repo"], "owner/alpha");
+    let span = &exporter.get_finished_spans().unwrap()[0];
+    let (trace_id, span_id) = dd_ids(span.span_context.trace_id(), span.span_context.span_id());
+    assert_eq!(lines[0]["dd.trace_id"], trace_id.as_str());
+    assert_eq!(lines[0]["dd.span_id"], span_id.as_str());
+}
+
+/// With the Agent down the exporter crates log every failed export. Those
+/// lines are limited so that they cannot bury real sync failures.
+#[test]
+fn exporter_error_lines_are_throttled() {
+    let capture = Capture::default();
+    let (provider, _exporter) = memory_provider();
+    let dispatch = json_dispatch(&capture, &provider);
+    with_default(&dispatch, || {
+        for _ in 0..5 {
+            ::tracing::error!(target: "libdd_trace_utils::send_with_retry", "Max retries exceeded");
+            ::tracing::error!(target: "libdd_data_pipeline::trace_exporter", "Error sending traces");
+        }
+        ::tracing::error!("sync failed");
+        ::tracing::error!("sync failed");
+    });
+
+    let lines = capture.json_lines();
+    let from_exporter = lines
+        .iter()
+        .filter(|line| {
+            line["target"]
+                .as_str()
+                .is_some_and(|t| t.starts_with("libdd_"))
+        })
+        .count();
+    assert_eq!(from_exporter, 1, "{lines:?}");
+    assert_eq!(lines.len(), 3, "ferry's own lines are never throttled");
 }
 
 // ---------------------------------------------------------------------------
@@ -531,354 +578,13 @@ fn operation_name_processor_makes_span_name_the_datadog_operation_name() {
 }
 
 // ---------------------------------------------------------------------------
-// real Datadog provider against a fake agent (spike items 2 and 3)
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Clone)]
-struct AgentRequest {
-    method: String,
-    path: String,
-    body: Vec<u8>,
-}
-
-fn is_trace_payload(request: &AgentRequest) -> bool {
-    request.method == "POST"
-        && (request.path.starts_with("/v0.4/traces")
-            || request.path.starts_with("/v0.5/traces")
-            || request.path.starts_with("/v1.0/traces"))
-}
-
-const INFO_JSON: &str = r#"{"version":"7.60.0","endpoints":["/v0.4/traces","/v0.5/traces","/v0.6/stats","/info"],"client_drop_p0s":false,"config":{}}"#;
-const TRACES_JSON: &str = r#"{"rate_by_service":{"service:ferry,env:test":1}}"#;
-
-fn emit_sync_span() {
-    let root = info_span!(
-        "ferry.sync_repo",
-        repo = "acme/widget",
-        forgejo_repo = "mirror/widget"
-    );
-    let _root = root.enter();
-    let _child = info_span!("git.fetch", git.side = "github").entered();
-}
-
-/// Creates spans through `tracing`, ends them, and shuts the provider down so
-/// the exporter flushes. Runs the blocking shutdown off the async runtime.
-async fn emit_and_shutdown(agent_url: &str) {
-    let settings = Settings {
-        env: Some("test".to_owned()),
-        version: "1.2.3".to_owned(),
-        ..Settings::default()
-    };
-    let url = parse_agent_url(agent_url).expect("agent URL is valid");
-    let provider = build_datadog_provider(&settings, &url);
-    let dispatch = Dispatch::new(tracing_subscriber::registry().with(otel_layer(&provider)));
-    with_default(&dispatch, emit_sync_span);
-    tokio::task::spawn_blocking(move || {
-        provider
-            .shutdown_with_timeout(Duration::from_secs(10))
-            .expect("provider shuts down");
-    })
-    .await
-    .unwrap();
-}
-
-/// Raising the log level must not strip the repository and the trace ID
-/// from the error lines that remain.
-#[test]
-fn error_lines_above_info_keep_span_fields_and_correlation_ids() {
-    let capture = Capture::default();
-    let (provider, exporter) = memory_provider();
-    let dispatch = json_dispatch_at(&capture, &provider, "warn");
-    with_default(&dispatch, || {
-        let span = info_span!("ferry.sync_repo", repo = "owner/alpha");
-        let _entered = span.enter();
-        info!("filtered out");
-        ::tracing::error!(error_kind = "network", "sync failed");
-    });
-
-    let lines = capture.json_lines();
-    assert_eq!(lines.len(), 1, "{lines:?}");
-    assert_eq!(lines[0]["message"], "sync failed");
-    assert_eq!(lines[0]["repo"], "owner/alpha");
-    let span = &exporter.get_finished_spans().unwrap()[0];
-    let (trace_id, span_id) = dd_ids(span.span_context.trace_id(), span.span_context.span_id());
-    assert_eq!(lines[0]["dd.trace_id"], trace_id.as_str());
-    assert_eq!(lines[0]["dd.span_id"], span_id.as_str());
-}
-
-/// With the Agent down the exporter crates log every failed export. Those
-/// lines are limited so that they cannot bury real sync failures.
-#[test]
-fn exporter_error_lines_are_throttled() {
-    let capture = Capture::default();
-    let (provider, _exporter) = memory_provider();
-    let dispatch = json_dispatch(&capture, &provider);
-    with_default(&dispatch, || {
-        for _ in 0..5 {
-            ::tracing::error!(target: "libdd_trace_utils::send_with_retry", "Max retries exceeded");
-            ::tracing::error!(target: "libdd_data_pipeline::trace_exporter", "Error sending traces");
-        }
-        ::tracing::error!("sync failed");
-        ::tracing::error!("sync failed");
-    });
-
-    let lines = capture.json_lines();
-    let from_exporter = lines
-        .iter()
-        .filter(|line| {
-            line["target"]
-                .as_str()
-                .is_some_and(|t| t.starts_with("libdd_"))
-        })
-        .count();
-    assert_eq!(from_exporter, 1, "{lines:?}");
-    assert_eq!(lines.len(), 3, "ferry's own lines are never throttled");
-}
-
-/// The log level must not decide whether a sync is traced.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn log_level_above_info_still_exports_traces() {
-    use wiremock::matchers::{method, path};
-    use wiremock::{Mock, MockServer, ResponseTemplate};
-
-    let server = MockServer::start().await;
-    Mock::given(method("GET"))
-        .and(path("/info"))
-        .respond_with(ResponseTemplate::new(200).set_body_raw(INFO_JSON, "application/json"))
-        .mount(&server)
-        .await;
-    Mock::given(wiremock::matchers::any())
-        .respond_with(ResponseTemplate::new(200).set_body_raw(TRACES_JSON, "application/json"))
-        .mount(&server)
-        .await;
-
-    let capture = Capture::default();
-    let (mut guard, dispatch) = Telemetry::build(
-        Settings {
-            env: Some("test".to_owned()),
-            version: "1.2.3".to_owned(),
-            trace_agent_url: Some(server.uri()),
-            log_level: "error".to_owned(),
-            ..Settings::default()
-        },
-        capture.clone(),
-    );
-    assert!(guard.tracing_enabled());
-    with_default(&dispatch, || {
-        emit_sync_span();
-        info!("filtered out of the log");
-    });
-    tokio::task::spawn_blocking(move || guard.shutdown())
-        .await
-        .unwrap();
-
-    assert_eq!(
-        capture.text(),
-        "",
-        "info lines must be filtered from the log"
-    );
-    let received = server.received_requests().await.unwrap();
-    let requests: Vec<AgentRequest> = received
-        .iter()
-        .map(|r| AgentRequest {
-            method: r.method.to_string(),
-            path: r.url.path().to_owned(),
-            body: r.body.clone(),
-        })
-        .collect();
-    assert_trace_payload(&requests);
-}
-
-fn assert_trace_payload(requests: &[AgentRequest]) {
-    let traces: Vec<_> = requests.iter().filter(|r| is_trace_payload(r)).collect();
-    assert!(
-        !traces.is_empty(),
-        "no trace payload reached the agent; saw: {:?}",
-        requests
-            .iter()
-            .map(|r| format!("{} {} ({} bytes)", r.method, r.path, r.body.len()))
-            .collect::<Vec<_>>()
-    );
-    // Spike finding: the exporter posts MessagePack to /v0.4/traces.
-    assert_eq!(traces[0].path, "/v0.4/traces");
-    let body = &traces[0].body;
-    let contains = |needle: &[u8]| body.windows(needle.len()).any(|w| w == needle);
-    // MessagePack fixstr entries: `name` is the Datadog operation name.
-    let name_entry = |name: &str| {
-        let mut entry = vec![0xa4];
-        entry.extend_from_slice(b"name");
-        entry.push(0xa0 | u8::try_from(name.len()).unwrap());
-        entry.extend_from_slice(name.as_bytes());
-        entry
-    };
-    assert!(
-        contains(&name_entry("ferry.sync_repo")),
-        "operation name of the root span is the tracing span name"
-    );
-    assert!(contains(&name_entry("git.fetch")), "child operation name");
-    assert!(contains(b"acme/widget"), "span attribute is in the payload");
-    assert!(contains(b"ferry"), "service name is in the payload");
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn datadog_provider_exports_to_an_http_agent() {
-    use wiremock::matchers::{method, path};
-    use wiremock::{Mock, MockServer, ResponseTemplate};
-
-    let server = MockServer::start().await;
-    Mock::given(method("GET"))
-        .and(path("/info"))
-        .respond_with(ResponseTemplate::new(200).set_body_raw(INFO_JSON, "application/json"))
-        .mount(&server)
-        .await;
-    Mock::given(wiremock::matchers::any())
-        .respond_with(ResponseTemplate::new(200).set_body_raw(TRACES_JSON, "application/json"))
-        .mount(&server)
-        .await;
-
-    emit_and_shutdown(&server.uri()).await;
-
-    let received = server.received_requests().await.unwrap();
-    let requests: Vec<AgentRequest> = received
-        .iter()
-        .map(|r| AgentRequest {
-            method: r.method.to_string(),
-            path: r.url.path().to_owned(),
-            body: r.body.clone(),
-        })
-        .collect();
-    assert_trace_payload(&requests);
-}
-
-/// A minimal HTTP/1.1 responder on a Unix socket that records every request.
-async fn serve_unix_agent(listener: tokio::net::UnixListener, log: Arc<Mutex<Vec<AgentRequest>>>) {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-    loop {
-        let Ok((mut stream, _)) = listener.accept().await else {
-            return;
-        };
-        let log = Arc::clone(&log);
-        tokio::spawn(async move {
-            let mut buf: Vec<u8> = Vec::new();
-            loop {
-                // Read until the end of the headers.
-                let header_end = loop {
-                    if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
-                        break pos + 4;
-                    }
-                    let mut chunk = [0_u8; 8192];
-                    match stream.read(&mut chunk).await {
-                        Ok(0) | Err(_) => return,
-                        Ok(n) => buf.extend_from_slice(&chunk[..n]),
-                    }
-                };
-                let head = String::from_utf8_lossy(&buf[..header_end]).into_owned();
-                let mut lines = head.lines();
-                let request_line = lines.next().unwrap_or_default().to_owned();
-                let mut parts = request_line.split_whitespace();
-                let method = parts.next().unwrap_or_default().to_owned();
-                let path = parts.next().unwrap_or_default().to_owned();
-                let header = |name: &str| {
-                    lines.clone().find_map(|l| {
-                        let (k, v) = l.split_once(':')?;
-                        k.eq_ignore_ascii_case(name).then(|| v.trim().to_owned())
-                    })
-                };
-                let chunked =
-                    header("transfer-encoding").is_some_and(|v| v.eq_ignore_ascii_case("chunked"));
-                let content_length: usize = header("content-length")
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(0);
-                buf.drain(..header_end);
-
-                let mut body = Vec::new();
-                if chunked {
-                    loop {
-                        // chunk-size line
-                        let line_end = loop {
-                            if let Some(pos) = buf.windows(2).position(|w| w == b"\r\n") {
-                                break pos;
-                            }
-                            let mut chunk = [0_u8; 8192];
-                            match stream.read(&mut chunk).await {
-                                Ok(0) | Err(_) => return,
-                                Ok(n) => buf.extend_from_slice(&chunk[..n]),
-                            }
-                        };
-                        let size_text = String::from_utf8_lossy(&buf[..line_end]).into_owned();
-                        let size =
-                            usize::from_str_radix(size_text.split(';').next().unwrap().trim(), 16)
-                                .unwrap_or(0);
-                        buf.drain(..line_end + 2);
-                        while buf.len() < size + 2 {
-                            let mut chunk = [0_u8; 8192];
-                            match stream.read(&mut chunk).await {
-                                Ok(0) | Err(_) => return,
-                                Ok(n) => buf.extend_from_slice(&chunk[..n]),
-                            }
-                        }
-                        body.extend_from_slice(&buf[..size]);
-                        buf.drain(..size + 2);
-                        if size == 0 {
-                            break;
-                        }
-                    }
-                } else {
-                    while buf.len() < content_length {
-                        let mut chunk = [0_u8; 8192];
-                        match stream.read(&mut chunk).await {
-                            Ok(0) | Err(_) => return,
-                            Ok(n) => buf.extend_from_slice(&chunk[..n]),
-                        }
-                    }
-                    body.extend_from_slice(&buf[..content_length]);
-                    buf.drain(..content_length);
-                }
-
-                let reply = if path == "/info" {
-                    INFO_JSON
-                } else {
-                    TRACES_JSON
-                };
-                log.lock()
-                    .unwrap()
-                    .push(AgentRequest { method, path, body });
-                let response = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{reply}",
-                    reply.len()
-                );
-                if stream.write_all(response.as_bytes()).await.is_err() {
-                    return;
-                }
-            }
-        });
-    }
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn datadog_provider_exports_to_a_unix_socket_agent() {
-    let dir = tempfile::tempdir().unwrap();
-    let socket = dir.path().join("apm.socket");
-    let listener = tokio::net::UnixListener::bind(&socket).unwrap();
-    let log = Arc::new(Mutex::new(Vec::new()));
-    let server = tokio::spawn(serve_unix_agent(listener, Arc::clone(&log)));
-
-    emit_and_shutdown(&format!("unix://{}", socket.display())).await;
-
-    let requests = log.lock().unwrap().clone();
-    server.abort();
-    assert_trace_payload(&requests);
-}
-
-// ---------------------------------------------------------------------------
 // disabled and invalid paths
 // ---------------------------------------------------------------------------
 
 #[test]
 fn unset_urls_disable_both_signals() {
     let capture = Capture::default();
-    let (mut guard, dispatch) = Telemetry::build(Settings::default(), capture.clone());
+    let (mut guard, dispatch) = telemetry::build(Settings::default(), capture.clone());
     assert!(!guard.metrics_enabled());
     assert!(!guard.tracing_enabled());
     assert!(guard.tracer_provider().is_none());
@@ -903,7 +609,7 @@ fn invalid_urls_warn_and_disable_instead_of_failing() {
             trace_agent_url: Some(trace.to_owned()),
             ..Settings::default()
         };
-        let (guard, _dispatch) = Telemetry::build(settings, capture.clone());
+        let (guard, _dispatch) = telemetry::build(settings, capture.clone());
         assert!(!guard.metrics_enabled(), "{dogstatsd}");
         assert!(!guard.tracing_enabled(), "{trace}");
         let text = capture.text();
@@ -923,7 +629,7 @@ fn invalid_log_level_falls_back_to_info() {
         log_level: "[[[".to_owned(),
         ..Settings::default()
     };
-    let (_guard, dispatch) = Telemetry::build(settings, capture.clone());
+    let (_guard, dispatch) = telemetry::build(settings, capture.clone());
     with_default(&dispatch, || info!("after fallback"));
     let text = capture.text();
     assert!(text.contains("FERRY_LOG_LEVEL"));
@@ -932,19 +638,16 @@ fn invalid_log_level_falls_back_to_info() {
 
 #[test]
 fn valid_urls_enable_both_signals_and_metrics_reach_the_socket() {
-    let server = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let (server, url) = udp_server();
     let settings = Settings {
         env: Some("test".to_owned()),
         version: "1.2.3".to_owned(),
-        dogstatsd_url: Some(format!(
-            "udp://127.0.0.1:{}",
-            server.local_addr().unwrap().port()
-        )),
+        dogstatsd_url: Some(url),
         // Nothing listens here; export failures must not matter.
         trace_agent_url: Some("http://127.0.0.1:9".to_owned()),
         ..Settings::default()
     };
-    let (mut guard, _dispatch) = Telemetry::build(settings, Capture::default());
+    let (mut guard, _dispatch) = telemetry::build(settings, Capture::default());
     assert!(guard.metrics_enabled());
     assert!(guard.tracing_enabled());
     guard.metrics().heartbeat();
@@ -976,137 +679,11 @@ async fn init_installs_global_subscriber_once() {
         log_level: "info".to_owned(),
         ..Settings::default()
     };
-    let guard = Telemetry::init(settings.clone());
+    let guard = telemetry::init(settings.clone());
     assert!(tracing::dispatcher::has_been_set());
     info!("global subscriber is live");
     // A second init must not panic; it keeps the first subscriber.
-    let second = Telemetry::init(settings);
+    let second = telemetry::init(settings);
     drop(second);
     drop(guard);
-}
-
-// ---------------------------------------------------------------------------
-// health (plan test 6, health half)
-// ---------------------------------------------------------------------------
-
-mod health {
-    use std::time::Duration;
-
-    use axum::body::Body;
-    use axum::http::{Request, StatusCode};
-    use ferry::health::{HealthState, LIVENESS_WINDOW, router};
-    use tokio_util::sync::CancellationToken;
-    use tower::ServiceExt;
-
-    async fn status(state: &HealthState, method: &str, path: &str) -> StatusCode {
-        router(state.clone())
-            .oneshot(
-                Request::builder()
-                    .method(method)
-                    .uri(path)
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap()
-            .status()
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn healthz_follows_the_heartbeat_under_a_paused_clock() {
-        let state = HealthState::new();
-        assert_eq!(state.heartbeat_age(), None);
-        assert!(!state.is_live());
-        assert_eq!(
-            status(&state, "GET", "/healthz").await,
-            StatusCode::SERVICE_UNAVAILABLE
-        );
-
-        state.beat();
-        assert_eq!(status(&state, "GET", "/healthz").await, StatusCode::OK);
-
-        tokio::time::advance(Duration::from_secs(59)).await;
-        assert_eq!(status(&state, "GET", "/healthz").await, StatusCode::OK);
-        assert_eq!(state.heartbeat_age(), Some(Duration::from_secs(59)));
-
-        tokio::time::advance(Duration::from_secs(2)).await;
-        assert!(state.heartbeat_age().unwrap() > LIVENESS_WINDOW);
-        assert_eq!(
-            status(&state, "GET", "/healthz").await,
-            StatusCode::SERVICE_UNAVAILABLE
-        );
-
-        state.beat();
-        assert_eq!(status(&state, "GET", "/healthz").await, StatusCode::OK);
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn readyz_is_503_until_ready_and_clones_share_state() {
-        let state = HealthState::new();
-        assert_eq!(
-            status(&state, "GET", "/readyz").await,
-            StatusCode::SERVICE_UNAVAILABLE
-        );
-        state.clone().set_ready(true);
-        assert!(state.is_ready());
-        assert_eq!(status(&state, "GET", "/readyz").await, StatusCode::OK);
-        state.set_ready(false);
-        assert_eq!(
-            status(&state, "GET", "/readyz").await,
-            StatusCode::SERVICE_UNAVAILABLE
-        );
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn only_the_two_routes_exist() {
-        let state = HealthState::new();
-        state.beat();
-        state.set_ready(true);
-        for path in ["/", "/metrics", "/healthz/", "/health", "/readyz/x"] {
-            assert_eq!(
-                status(&state, "GET", path).await,
-                StatusCode::NOT_FOUND,
-                "{path}"
-            );
-        }
-        assert_eq!(
-            status(&state, "POST", "/healthz").await,
-            StatusCode::METHOD_NOT_ALLOWED
-        );
-    }
-
-    #[tokio::test]
-    async fn serve_answers_over_tcp_and_stops_on_cancel() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let state = HealthState::new();
-        let shutdown = CancellationToken::new();
-        let task = tokio::spawn(ferry::health::serve(
-            listener,
-            state.clone(),
-            shutdown.clone(),
-        ));
-
-        let client = reqwest::Client::new();
-        let url = format!("http://{addr}/healthz");
-        assert_eq!(client.get(&url).send().await.unwrap().status(), 503);
-        state.beat();
-        assert_eq!(client.get(&url).send().await.unwrap().status(), 200);
-        assert_eq!(
-            client
-                .get(format!("http://{addr}/nope"))
-                .send()
-                .await
-                .unwrap()
-                .status(),
-            404
-        );
-
-        shutdown.cancel();
-        tokio::time::timeout(Duration::from_secs(5), task)
-            .await
-            .expect("server stops after cancellation")
-            .unwrap()
-            .unwrap();
-    }
 }

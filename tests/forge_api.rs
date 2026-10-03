@@ -1,5 +1,7 @@
 //! HTTP tests for the GitHub and Forgejo clients, against `wiremock`.
 
+mod support;
+
 use std::time::Duration;
 
 use ferry::config::Token;
@@ -10,8 +12,8 @@ use serde_json::{Value, json};
 use wiremock::matchers::{body_json, header, method, path, query_param};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
-const FORGEJO_TOKEN: &str = "test-forgejo-token-not-real";
-const GITHUB_TOKEN: &str = "test-github-token-not-real";
+use support::{FORGEJO_TOKEN, GITHUB_TOKEN};
+
 const UA: &str = concat!("ferry/", env!("CARGO_PKG_VERSION"));
 
 fn forgejo(server: &MockServer) -> ForgejoClient {
@@ -100,11 +102,8 @@ async fn github_null_description_becomes_empty_and_no_token_sends_no_auth() {
     );
 }
 
-async fn github_status(
-    status: u16,
-    headers: &[(&str, &str)],
-    body: &str,
-) -> Result<ferry::forge::SourceMeta, ForgeError> {
+/// A server that answers every GET with `status`, `headers`, and `body`.
+async fn status_server(status: u16, headers: &[(&str, &str)], body: &str) -> MockServer {
     let server = MockServer::start().await;
     let mut resp = ResponseTemplate::new(status).set_body_string(body);
     for (k, v) in headers {
@@ -114,6 +113,15 @@ async fn github_status(
         .respond_with(resp)
         .mount(&server)
         .await;
+    server
+}
+
+async fn github_status(
+    status: u16,
+    headers: &[(&str, &str)],
+    body: &str,
+) -> Result<ferry::forge::SourceMeta, ForgeError> {
+    let server = status_server(status, headers, body).await;
     github(&server, Some(GITHUB_TOKEN)).get_repo("o", "r").await
 }
 
@@ -305,15 +313,7 @@ async fn forgejo_status(
     headers: &[(&str, &str)],
     body: &str,
 ) -> Result<String, ForgeError> {
-    let server = MockServer::start().await;
-    let mut resp = ResponseTemplate::new(status).set_body_string(body);
-    for (k, v) in headers {
-        resp = resp.insert_header(*k, *v);
-    }
-    Mock::given(method("GET"))
-        .respond_with(resp)
-        .mount(&server)
-        .await;
+    let server = status_server(status, headers, body).await;
     forgejo(&server).whoami().await
 }
 

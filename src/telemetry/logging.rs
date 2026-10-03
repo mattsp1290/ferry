@@ -44,6 +44,8 @@ use tracing_subscriber::fmt::time::{FormatTime, SystemTime};
 use tracing_subscriber::layer::{Context, Layer};
 use tracing_subscriber::registry::LookupSpan;
 
+use super::ConstTags;
+
 /// Fields recorded on one span, stored in the span's extensions.
 #[derive(Debug, Default)]
 struct SpanFields(Map<String, Value>);
@@ -90,19 +92,15 @@ impl Visit for FieldVisitor<'_> {
 /// JSON-lines log layer. See the module docs for the output contract.
 pub struct JsonLogLayer<W> {
     make_writer: W,
-    service: String,
-    env: Option<String>,
-    version: String,
+    tags: ConstTags,
     dispatch: OnceLock<WeakDispatch>,
 }
 
 impl<W> JsonLogLayer<W> {
-    pub fn new(make_writer: W, service: String, env: Option<String>, version: String) -> Self {
+    pub fn new(make_writer: W, tags: ConstTags) -> Self {
         Self {
             make_writer,
-            service,
-            env,
-            version,
+            tags,
             dispatch: OnceLock::new(),
         }
     }
@@ -215,12 +213,18 @@ where
             "target".to_owned(),
             Value::String(metadata.target().to_owned()),
         );
-        out.insert("service".to_owned(), Value::String(self.service.clone()));
-        match &self.env {
+        out.insert(
+            "service".to_owned(),
+            Value::String(self.tags.service.clone()),
+        );
+        match &self.tags.env {
             Some(env) => out.insert("env".to_owned(), Value::String(env.clone())),
             None => out.remove("env"),
         };
-        out.insert("version".to_owned(), Value::String(self.version.clone()));
+        out.insert(
+            "version".to_owned(),
+            Value::String(self.tags.version.clone()),
+        );
 
         out.remove("dd.trace_id");
         out.remove("dd.span_id");

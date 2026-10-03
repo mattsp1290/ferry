@@ -6,12 +6,11 @@
 //! liveness even while other tasks keep running.
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use tokio::task::{Id, JoinError, JoinSet};
+use tokio::task::{Id, JoinError, JoinHandle, JoinSet};
 use tokio::time::{Instant, MissedTickBehavior};
 use tokio_util::sync::CancellationToken;
 
@@ -19,6 +18,7 @@ use crate::config::{Config, RepoEntry};
 use crate::health::HealthState;
 use crate::sync::{ErrorKind, SyncOutcome};
 use crate::telemetry::Metrics;
+use crate::util::lock;
 
 /// Upper bound of the failure backoff.
 pub const MAX_BACKOFF: Duration = Duration::from_secs(3600);
@@ -105,19 +105,21 @@ impl SharedStatus {
         now.saturating_duration_since(status.last_success.unwrap_or(self.started))
     }
 
-    fn update(&self, index: usize, status: EntryStatus) {
-        self.lock()[index] = status;
+    /// Applies `change` to one entry's status and returns the new value.
+    fn update(&self, index: usize, change: impl FnOnce(&mut EntryStatus)) -> EntryStatus {
+        let mut statuses = self.lock();
+        change(&mut statuses[index]);
+        statuses[index]
     }
 
     fn lock(&self) -> MutexGuard<'_, Vec<EntryStatus>> {
-        self.statuses.lock().unwrap_or_else(PoisonError::into_inner)
+        lock(&self.statuses)
     }
 }
 
 struct EntryState {
     next_attempt: Instant,
     in_flight: bool,
-    status: EntryStatus,
 }
 
 struct Running {
@@ -125,9 +127,91 @@ struct Running {
     started: Instant,
 }
 
-enum Finished {
-    Ready(Result<(), String>),
-    Sync(SyncOutcome),
+/// The running sync tasks and what each one is syncing.
+struct SyncTasks {
+    tasks: JoinSet<SyncOutcome>,
+    running: HashMap<Id, Running>,
+}
+
+impl SyncTasks {
+    fn new() -> Self {
+        Self {
+            tasks: JoinSet::new(),
+            running: HashMap::new(),
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.running.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.running.is_empty()
+    }
+
+    fn spawn(
+        &mut self,
+        syncer: &Arc<dyn Syncer>,
+        index: usize,
+        entry: RepoEntry,
+        started: Instant,
+    ) {
+        let syncer = Arc::clone(syncer);
+        let handle = self.tasks.spawn(async move { syncer.sync(&entry).await });
+        self.running.insert(handle.id(), Running { index, started });
+    }
+
+    /// The next finished task and what it was syncing. A panic in a sync task
+    /// stops at the task boundary and arrives as the `Err`.
+    async fn join_next(&mut self) -> Option<(Running, Result<SyncOutcome, JoinError>)> {
+        let joined = self.tasks.join_next_with_id().await?;
+        let (id, result) = match joined {
+            Ok((id, outcome)) => (id, Ok(outcome)),
+            Err(error) => (error.id(), Err(error)),
+        };
+        // Every task is registered right after it is spawned, so the entry
+        // is always there.
+        let running = self.running.remove(&id)?;
+        Some((running, result))
+    }
+
+    async fn shutdown(&mut self) {
+        self.tasks.shutdown().await;
+        self.running.clear();
+    }
+}
+
+/// Progress of the startup check that needs the network.
+enum Readiness {
+    /// Not ready; the next check may start at `next_attempt`.
+    Waiting {
+        failures: u32,
+        next_attempt: Instant,
+    },
+    Checking {
+        failures: u32,
+        check: JoinHandle<Result<(), String>>,
+    },
+    Ready,
+}
+
+impl Drop for Readiness {
+    /// A dropped scheduler must not leave its readiness check running.
+    fn drop(&mut self) {
+        if let Self::Checking { check, .. } = self {
+            check.abort();
+        }
+    }
+}
+
+/// Resolves when a running readiness check finishes; pending otherwise.
+async fn readiness_check_finished(
+    readiness: &mut Readiness,
+) -> Result<Result<(), String>, JoinError> {
+    match readiness {
+        Readiness::Checking { check, .. } => check.await,
+        _ => std::future::pending().await,
+    }
 }
 
 pub struct Scheduler {
@@ -137,12 +221,8 @@ pub struct Scheduler {
     config: SchedulerConfig,
     shared: SharedStatus,
     states: Vec<EntryState>,
-    tasks: JoinSet<Finished>,
-    running: HashMap<Id, Running>,
-    ready: bool,
-    ready_check_in_flight: bool,
-    ready_failures: u32,
-    next_ready_attempt: Instant,
+    syncs: SyncTasks,
+    readiness: Readiness,
     jitter: Box<dyn FnMut() -> f64 + Send>,
 }
 
@@ -161,7 +241,6 @@ impl Scheduler {
             .map(|_| EntryState {
                 next_attempt: now,
                 in_flight: false,
-                status: EntryStatus::default(),
             })
             .collect();
         Self {
@@ -171,12 +250,11 @@ impl Scheduler {
             config,
             shared,
             states,
-            tasks: JoinSet::new(),
-            running: HashMap::new(),
-            ready: false,
-            ready_check_in_flight: false,
-            ready_failures: 0,
-            next_ready_attempt: now,
+            syncs: SyncTasks::new(),
+            readiness: Readiness::Waiting {
+                failures: 0,
+                next_attempt: now,
+            },
             jitter: Box::new(|| fastrand::f64() * 2.0 - 1.0),
         }
     }
@@ -205,9 +283,19 @@ impl Scheduler {
                     self.start_ready_check();
                     self.start_due();
                 }
-                Some(joined) = self.tasks.join_next_with_id() => {
-                    self.finish(joined);
+                Some((running, result)) = self.syncs.join_next() => {
+                    self.finish_sync(running, result);
                     // Refill the freed slot now instead of at the next tick.
+                    self.start_due();
+                }
+                result = readiness_check_finished(&mut self.readiness) => {
+                    match result {
+                        Ok(result) => self.finish_ready_check(result),
+                        Err(error) => {
+                            tracing::error!(error = %error, "readiness check task failed");
+                            self.finish_ready_check(Err(error.to_string()));
+                        }
+                    }
                     self.start_due();
                 }
             }
@@ -217,13 +305,19 @@ impl Scheduler {
     }
 
     fn start_ready_check(&mut self) {
-        if self.ready || self.ready_check_in_flight || Instant::now() < self.next_ready_attempt {
+        let Readiness::Waiting {
+            failures,
+            next_attempt,
+        } = self.readiness
+        else {
+            return;
+        };
+        if Instant::now() < next_attempt {
             return;
         }
         let syncer = Arc::clone(&self.syncer);
-        self.tasks
-            .spawn(async move { Finished::Ready(syncer.check_ready().await) });
-        self.ready_check_in_flight = true;
+        let check = tokio::spawn(async move { syncer.check_ready().await });
+        self.readiness = Readiness::Checking { failures, check };
     }
 
     /// Starts due entries up to the concurrency limit, the longest-waiting
@@ -231,14 +325,11 @@ impl Scheduler {
     /// would starve the tail of an allowlist that is too large for one poll
     /// interval. No sync starts before the first successful readiness check.
     fn start_due(&mut self) {
-        if !self.ready {
+        if !matches!(self.readiness, Readiness::Ready) {
             return;
         }
         let now = Instant::now();
-        let free = self
-            .config
-            .max_concurrency
-            .saturating_sub(self.running.len());
+        let free = self.config.max_concurrency.saturating_sub(self.syncs.len());
         let mut due: Vec<usize> = (0..self.states.len())
             .filter(|&index| {
                 let state = &self.states[index];
@@ -249,59 +340,41 @@ impl Scheduler {
 
         for index in due.into_iter().take(free) {
             self.states[index].in_flight = true;
-            let syncer = Arc::clone(&self.syncer);
             let entry = self.shared.entries()[index].clone();
-            let handle = self
-                .tasks
-                .spawn(async move { Finished::Sync(syncer.sync(&entry).await) });
-            self.running.insert(
-                handle.id(),
-                Running {
-                    index,
-                    started: now,
-                },
-            );
+            self.syncs.spawn(&self.syncer, index, entry, now);
         }
     }
 
-    fn finish(&mut self, joined: Result<(Id, Finished), JoinError>) {
-        match joined {
-            Ok((_, Finished::Ready(result))) => self.finish_ready_check(result),
-            Ok((id, Finished::Sync(outcome))) => {
-                if let Some(running) = self.running.remove(&id) {
-                    self.record(running, outcome);
-                }
+    fn finish_sync(&mut self, running: Running, result: Result<SyncOutcome, JoinError>) {
+        let outcome = match result {
+            Ok(outcome) => outcome,
+            // A panic in a sync task counts as a failure of that entry only.
+            Err(error) => {
+                let repo = self.shared.entries()[running.index].repo_tag();
+                tracing::error!(repo, error = %error, "sync task failed");
+                SyncOutcome::error(ErrorKind::Internal, running.started.elapsed())
             }
-            // A panic in a sync task stops at the task boundary. It counts as
-            // a failure of that entry only.
-            Err(error) => match self.running.remove(&error.id()) {
-                Some(running) => {
-                    let repo = self.shared.entries()[running.index].repo_tag();
-                    tracing::error!(repo, error = %error, "sync task failed");
-                    let outcome =
-                        SyncOutcome::error(ErrorKind::Internal, running.started.elapsed());
-                    self.record(running, outcome);
-                }
-                None => {
-                    tracing::error!(error = %error, "readiness check task failed");
-                    self.finish_ready_check(Err(error.to_string()));
-                }
-            },
-        }
+        };
+        self.record(running, outcome);
     }
 
     fn finish_ready_check(&mut self, result: Result<(), String>) {
-        self.ready_check_in_flight = false;
+        let Readiness::Checking { failures, .. } = self.readiness else {
+            return;
+        };
         match result {
             Ok(()) => {
-                self.ready = true;
+                self.readiness = Readiness::Ready;
                 self.health.set_ready(true);
                 tracing::info!("startup checks passed; starting syncs");
             }
             Err(reason) => {
-                self.ready_failures = self.ready_failures.saturating_add(1);
-                let delay = exponential(READY_RETRY_INITIAL, self.ready_failures, READY_RETRY_MAX);
-                self.next_ready_attempt = later(Instant::now(), delay);
+                let failures = failures.saturating_add(1);
+                let delay = exponential(READY_RETRY_INITIAL, failures, READY_RETRY_MAX);
+                self.readiness = Readiness::Waiting {
+                    failures,
+                    next_attempt: later(Instant::now(), delay),
+                };
                 tracing::warn!(
                     reason,
                     retry_in_seconds = delay.as_secs(),
@@ -321,34 +394,39 @@ impl Scheduler {
         let state = &mut self.states[index];
         state.in_flight = false;
         if outcome.result.is_success() {
-            state.status = EntryStatus {
-                last_success: Some(now),
-                consecutive_failures: 0,
-            };
+            self.shared.update(index, |status| {
+                *status = EntryStatus {
+                    last_success: Some(now),
+                    consecutive_failures: 0,
+                };
+            });
             state.next_attempt = later(started, poll_interval);
         } else {
-            state.status.consecutive_failures = state.status.consecutive_failures.saturating_add(1);
+            let status = self.shared.update(index, |status| {
+                status.consecutive_failures = status.consecutive_failures.saturating_add(1);
+            });
             let delay = failure_delay(
                 poll_interval,
-                state.status.consecutive_failures,
+                status.consecutive_failures,
                 outcome.retry_after,
                 (self.jitter)(),
             );
             state.next_attempt = later(now, delay);
         }
-        self.shared.update(index, state.status);
     }
 
     /// Shutdown: start nothing new, give in-flight syncs `shutdown_grace`,
     /// then cancel them and give their git children `cancel_grace` to die.
     async fn drain(mut self, ticker: &mut tokio::time::Interval, cancel_syncs: CancellationToken) {
-        if self.running.is_empty() {
+        if self.syncs.is_empty() {
             // At most a readiness check is in flight. Nothing waits for it.
-            self.tasks.shutdown().await;
+            if let Readiness::Checking { check, .. } = &self.readiness {
+                check.abort();
+            }
             return;
         }
         tracing::info!(
-            in_flight = self.running.len(),
+            in_flight = self.syncs.len(),
             "shutdown requested; waiting for in-flight syncs"
         );
         let grace = tokio::time::sleep(self.config.shutdown_grace);
@@ -357,26 +435,26 @@ impl Scheduler {
             tokio::select! {
                 () = &mut grace => break,
                 _ = ticker.tick() => self.health.beat(),
-                joined = self.tasks.join_next_with_id() => match joined {
-                    Some(joined) => self.finish(joined),
+                joined = self.syncs.join_next() => match joined {
+                    Some((running, result)) => self.finish_sync(running, result),
                     None => return,
                 },
             }
         }
 
         tracing::warn!(
-            in_flight = self.running.len(),
+            in_flight = self.syncs.len(),
             "in-flight syncs outlived the shutdown grace period; cancelling them"
         );
         cancel_syncs.cancel();
         // Outcomes of cancelled syncs are not recorded: the interruption is
         // ferry's own doing, and the next run repairs the repository.
         let stopped = tokio::time::timeout(self.config.cancel_grace, async {
-            while self.tasks.join_next().await.is_some() {}
+            while self.syncs.join_next().await.is_some() {}
         })
         .await;
         if stopped.is_err() {
-            self.tasks.shutdown().await;
+            self.syncs.shutdown().await;
         }
     }
 }
@@ -429,147 +507,27 @@ pub async fn run_once(
     cancel: &CancellationToken,
 ) -> Vec<Option<SyncOutcome>> {
     let mut outcomes: Vec<Option<SyncOutcome>> = vec![None; entries.len()];
-    let mut tasks: JoinSet<SyncOutcome> = JoinSet::new();
-    let mut running: HashMap<Id, Running> = HashMap::new();
+    let mut syncs = SyncTasks::new();
     let mut next = 0;
 
     loop {
-        while next < entries.len() && tasks.len() < max_concurrency.max(1) && !cancel.is_cancelled()
+        while next < entries.len() && syncs.len() < max_concurrency.max(1) && !cancel.is_cancelled()
         {
-            let syncer = Arc::clone(&syncer);
-            let entry = entries[next].clone();
-            let handle = tasks.spawn(async move { syncer.sync(&entry).await });
-            running.insert(
-                handle.id(),
-                Running {
-                    index: next,
-                    started: Instant::now(),
-                },
-            );
+            syncs.spawn(&syncer, next, entries[next].clone(), Instant::now());
             next += 1;
         }
-        let Some(joined) = tasks.join_next_with_id().await else {
+        let Some((Running { index, started }, result)) = syncs.join_next().await else {
             break;
         };
-        let (id, outcome) = match joined {
-            Ok((id, outcome)) => (id, Some(outcome)),
-            Err(error) => {
-                tracing::error!(error = %error, "sync task failed");
-                (error.id(), None)
-            }
-        };
-        if let Some(Running { index, started }) = running.remove(&id) {
-            let outcome = outcome
-                .unwrap_or_else(|| SyncOutcome::error(ErrorKind::Internal, started.elapsed()));
-            metrics.sync_finished(&entries[index], &outcome);
-            outcomes[index] = Some(outcome);
-        }
+        let outcome = result.unwrap_or_else(|error| {
+            tracing::error!(error = %error, "sync task failed");
+            SyncOutcome::error(ErrorKind::Internal, started.elapsed())
+        });
+        metrics.sync_finished(&entries[index], &outcome);
+        outcomes[index] = Some(outcome);
     }
 
     outcomes
-}
-
-/// Settings of the periodic metrics emitter.
-#[derive(Debug, Clone)]
-pub struct EmitterConfig {
-    pub interval: Duration,
-    /// Directory measured for `ferry.cache.bytes`. `None` disables the gauge.
-    pub cache_dir: Option<PathBuf>,
-    /// The cache is measured at most this often: walking it is not free.
-    pub cache_scan_interval: Duration,
-}
-
-impl EmitterConfig {
-    pub fn from_config(config: &Config) -> Self {
-        Self {
-            interval: Duration::from_secs(30),
-            cache_dir: Some(config.sync.cache_dir.clone()),
-            cache_scan_interval: Duration::from_secs(15 * 60),
-        }
-    }
-}
-
-/// Emits the gauges every `interval` until `shutdown` is cancelled.
-///
-/// This task only reads scheduler state. It never writes the scheduler
-/// heartbeat, and it emits `ferry.heartbeat` only while that heartbeat is
-/// fresh, so a wedged scheduler shows up as missing data in Datadog.
-pub async fn run_emitter(
-    metrics: Arc<dyn Metrics>,
-    health: HealthState,
-    shared: SharedStatus,
-    config: EmitterConfig,
-    shutdown: CancellationToken,
-) {
-    let mut ticker = tokio::time::interval(config.interval);
-    ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
-    let mut last_cache_scan: Option<Instant> = None;
-    let mut cache_scan: Option<tokio::task::JoinHandle<()>> = None;
-
-    loop {
-        tokio::select! {
-            () = shutdown.cancelled() => break,
-            _ = ticker.tick() => {}
-        }
-
-        let now = Instant::now();
-        metrics.repos_configured(shared.entries().len());
-        for (entry, status) in shared.entries().iter().zip(shared.snapshot()) {
-            metrics.repo_state(
-                entry,
-                shared.last_success_age(&status, now),
-                status.consecutive_failures,
-            );
-        }
-        if health.is_live() {
-            metrics.heartbeat();
-        }
-
-        let scan_due = last_cache_scan
-            .is_none_or(|last| now.saturating_duration_since(last) >= config.cache_scan_interval);
-        let scan_running = cache_scan.as_ref().is_some_and(|scan| !scan.is_finished());
-        if let Some(cache_dir) = config
-            .cache_dir
-            .as_ref()
-            .filter(|_| scan_due && !scan_running)
-        {
-            last_cache_scan = Some(now);
-            // Walking a large LFS cache can take longer than the emit
-            // interval. It runs on its own task so that it never delays the
-            // heartbeat, which a monitor alerts on.
-            cache_scan = Some(tokio::spawn(scan_cache(
-                Arc::clone(&metrics),
-                cache_dir.clone(),
-            )));
-        }
-    }
-
-    if let Some(scan) = cache_scan {
-        scan.abort();
-    }
-}
-
-async fn scan_cache(metrics: Arc<dyn Metrics>, cache_dir: PathBuf) {
-    match tokio::task::spawn_blocking(move || directory_bytes(&cache_dir)).await {
-        Ok(bytes) => metrics.cache_bytes(bytes),
-        Err(error) => tracing::warn!(error = %error, "cache size scan failed"),
-    }
-}
-
-/// Sum of the file sizes under `path`. Unreadable entries count as zero:
-/// git rewrites the cache while this walks it.
-fn directory_bytes(path: &Path) -> u64 {
-    let Ok(entries) = std::fs::read_dir(path) else {
-        return 0;
-    };
-    entries
-        .flatten()
-        .map(|entry| match entry.file_type() {
-            Ok(kind) if kind.is_dir() => directory_bytes(&entry.path()),
-            Ok(kind) if kind.is_file() => entry.metadata().map_or(0, |meta| meta.len()),
-            _ => 0,
-        })
-        .sum()
 }
 
 #[cfg(test)]
@@ -620,15 +578,5 @@ mod tests {
         let now = Instant::now();
         assert!(later(now, delay) > now);
         assert_eq!(later(now, Duration::MAX), now + MAX_BACKOFF);
-    }
-
-    #[test]
-    fn directory_bytes_sums_nested_files() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        std::fs::create_dir_all(dir.path().join("a/b")).expect("mkdir");
-        std::fs::write(dir.path().join("top"), [0u8; 10]).expect("write");
-        std::fs::write(dir.path().join("a/b/nested"), [0u8; 32]).expect("write");
-        assert_eq!(directory_bytes(dir.path()), 42);
-        assert_eq!(directory_bytes(&dir.path().join("absent")), 0);
     }
 }

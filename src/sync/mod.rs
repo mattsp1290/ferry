@@ -12,7 +12,7 @@ pub mod outcome;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Display;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -25,6 +25,7 @@ use crate::forge::{CreateOutcome, DestRepo, ForgeError, ForgejoClient, GithubCli
 use crate::git::{Git, GitError, GitErrorKind, RefMap, Remote, RemoteState, Side};
 use crate::scheduler::Syncer;
 use crate::telemetry;
+use crate::util::lock;
 
 pub use outcome::{ErrorKind, SyncOutcome, SyncResult};
 
@@ -104,10 +105,7 @@ impl SyncContext {
     /// attempt. A failed request therefore also waits one interval.
     fn take_metadata_turn(&self, entry: &RepoEntry) -> bool {
         let now = Instant::now();
-        let mut checked = self
-            .metadata_checked
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
+        let mut checked = lock(&self.metadata_checked);
         let due = checked
             .get(&entry.repo_tag())
             .is_none_or(|last| now.saturating_duration_since(*last) >= self.metadata_interval);
@@ -118,11 +116,7 @@ impl SyncContext {
     }
 
     fn warn_public_once(&self, entry: &RepoEntry) {
-        let first = self
-            .public_warned
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert(entry.repo_tag());
+        let first = lock(&self.public_warned).insert(entry.repo_tag());
         if first {
             tracing::warn!(
                 forgejo_repo = %entry.forgejo,
@@ -133,21 +127,10 @@ impl SyncContext {
 }
 
 /// Adapts the sync engine to the scheduler.
-pub struct RepoSyncer {
-    ctx: SyncContext,
-}
-
-impl RepoSyncer {
-    pub fn new(ctx: SyncContext) -> Self {
-        Self { ctx }
-    }
-}
-
 #[async_trait]
-impl Syncer for RepoSyncer {
+impl Syncer for SyncContext {
     async fn check_ready(&self) -> Result<(), String> {
-        self.ctx
-            .forgejo
+        self.forgejo
             .whoami()
             .await
             .map(drop)
@@ -155,7 +138,7 @@ impl Syncer for RepoSyncer {
     }
 
     async fn sync(&self, entry: &RepoEntry) -> SyncOutcome {
-        sync_repo(&self.ctx, entry).await
+        sync_repo(self, entry).await
     }
 }
 
@@ -284,12 +267,8 @@ pub async fn sync_repo(ctx: &SyncContext, entry: &RepoEntry) -> SyncOutcome {
 
         let span = tracing::Span::current();
         let outcome = match finished {
-            Ok(done) => {
-                let mut outcome = SyncOutcome::success(done.result, duration);
-                outcome.refs_changed = done.refs_changed;
-                outcome.refs_pruned = done.refs_pruned;
-                outcome
-            }
+            Ok(done) => SyncOutcome::success(done.result, duration)
+                .with_refs(done.refs_changed, done.refs_pruned),
             Err(failure) => {
                 if failure.cancelled {
                     tracing::info!(duration_ms, "sync cancelled by shutdown");
@@ -303,9 +282,7 @@ pub async fn sync_repo(ctx: &SyncContext, entry: &RepoEntry) -> SyncOutcome {
                         "sync failed"
                     );
                 }
-                let mut outcome = SyncOutcome::error(failure.kind, duration);
-                outcome.retry_after = failure.retry_after;
-                outcome
+                SyncOutcome::error(failure.kind, duration).with_retry_after(failure.retry_after)
             }
         };
 
@@ -338,22 +315,34 @@ pub async fn sync_repo(ctx: &SyncContext, entry: &RepoEntry) -> SyncOutcome {
     .await
 }
 
+/// Where one entry goes: the Forgejo owner and name, and the git remote.
+struct Dest<'a> {
+    owner: &'a str,
+    name: &'a str,
+    remote: &'a Remote,
+}
+
 async fn run(ctx: &SyncContext, entry: &RepoEntry) -> Result<Done, Failure> {
     let (owner, name) = entry.forgejo_parts();
     let source = ctx.source_remote(entry);
-    let dest = ctx.dest_remote(entry);
+    let dest_remote = ctx.dest_remote(entry);
+    let dest = Dest {
+        owner,
+        name,
+        remote: &dest_remote,
+    };
     let cache = ctx.cache_path(entry);
 
     let src = ctx.git.ls_remote(&source).await.map_err(Failure::source)?;
 
     let (dest_repo, dst) = match ctx
         .forgejo
-        .get_repo(owner, name)
+        .get_repo(dest.owner, dest.name)
         .await
         .map_err(Failure::forgejo)?
     {
         Some(repo) => {
-            let dst = inspect_existing(ctx, entry, &repo, &dest).await?;
+            let dst = inspect_existing(ctx, entry, &dest, &repo).await?;
             (repo, dst)
         }
         None => provision(ctx, entry, &dest).await?,
@@ -376,9 +365,17 @@ async fn run(ctx: &SyncContext, entry: &RepoEntry) -> Result<Done, Failure> {
     }
 
     let lfs_current =
-        !entry.lfs || marker::is_current(&cache, &lfs_marker_value(&src.refs, &dest)).await;
+        !entry.lfs || marker::is_current(&cache, &lfs_marker_value(&src.refs, dest.remote)).await;
     if src.refs == dst.refs && lfs_current {
-        reconcile_metadata(ctx, entry, &dest_repo, src.head.as_deref(), &dst.refs).await?;
+        reconcile_metadata(
+            ctx,
+            entry,
+            &dest,
+            &dest_repo,
+            src.head.as_deref(),
+            &dst.refs,
+        )
+        .await?;
         return Ok(Done::unchanged(SyncResult::Noop));
     }
 
@@ -405,30 +402,34 @@ async fn run(ctx: &SyncContext, entry: &RepoEntry) -> Result<Done, Failure> {
             .await
             .map_err(|error| Failure::git(ErrorKind::Lfs, error))?;
         ctx.git
-            .lfs_push(&cache, &dest)
+            .lfs_push(&cache, dest.remote)
             .await
             .map_err(|error| Failure::git(ErrorKind::Lfs, error))?;
     }
 
     ctx.git
-        .push(&cache, &dest, false)
+        .push(&cache, dest.remote, false)
         .await
         .map_err(Failure::dest)?;
 
     // Push, then switch the default branch, then prune. Forgejo refuses to
     // delete its default branch, so a renamed default branch must be switched
     // before the old one is pruned.
-    reconcile_metadata(ctx, entry, &dest_repo, src.head.as_deref(), &local).await?;
+    reconcile_metadata(ctx, entry, &dest, &dest_repo, src.head.as_deref(), &local).await?;
 
     let refs_pruned = count(dst.refs.missing_in(&local).len());
     if refs_pruned > 0 {
         ctx.git
-            .push(&cache, &dest, true)
+            .push(&cache, dest.remote, true)
             .await
             .map_err(Failure::dest)?;
     }
 
-    let verified = ctx.git.ls_remote(&dest).await.map_err(Failure::dest)?;
+    let verified = ctx
+        .git
+        .ls_remote(dest.remote)
+        .await
+        .map_err(Failure::dest)?;
     if verified.refs != local {
         return Err(Failure::new(
             ErrorKind::VerifyMismatch,
@@ -439,7 +440,7 @@ async fn run(ctx: &SyncContext, entry: &RepoEntry) -> Result<Done, Failure> {
         ));
     }
     if entry.lfs {
-        marker::write(&cache, &lfs_marker_value(&local, &dest))
+        marker::write(&cache, &lfs_marker_value(&local, dest.remote))
             .await
             .map_err(|error| {
                 Failure::new(
@@ -472,10 +473,9 @@ fn count(value: usize) -> u32 {
 async fn inspect_existing(
     ctx: &SyncContext,
     entry: &RepoEntry,
+    dest: &Dest<'_>,
     repo: &DestRepo,
-    dest: &Remote,
 ) -> Result<RemoteState, Failure> {
-    let (owner, name) = entry.forgejo_parts();
     if repo.mirror {
         // A pull mirror is read-only and owned by Forgejo's own mirror job.
         return Err(Failure::new(
@@ -487,10 +487,14 @@ async fn inspect_existing(
         ctx.warn_public_once(entry);
     }
 
-    let dst = ctx.git.ls_remote(dest).await.map_err(Failure::dest)?;
+    let dst = ctx
+        .git
+        .ls_remote(dest.remote)
+        .await
+        .map_err(Failure::dest)?;
     let managed = ctx
         .forgejo
-        .has_marker(owner, name)
+        .has_marker(dest.owner, dest.name)
         .await
         .map_err(Failure::forgejo)?;
     // Forgejo's own `empty` flag must agree with the ref listing. If the
@@ -519,7 +523,7 @@ async fn inspect_existing(
             );
         }
         ctx.forgejo
-            .add_marker(owner, name)
+            .add_marker(dest.owner, dest.name)
             .await
             .map_err(Failure::forgejo)?;
     }
@@ -528,7 +532,7 @@ async fn inspect_existing(
         // provisioned: either ferry created it and a later step failed, or
         // it was created empty for ferry. Without this, a failure between
         // create and the Actions edit would leave Actions on for good.
-        set_actions(ctx, entry).await?;
+        set_actions(ctx, entry, dest).await?;
     }
     Ok(dst)
 }
@@ -537,28 +541,27 @@ async fn inspect_existing(
 async fn provision(
     ctx: &SyncContext,
     entry: &RepoEntry,
-    dest: &Remote,
+    dest: &Dest<'_>,
 ) -> Result<(DestRepo, RemoteState), Failure> {
-    let (owner, name) = entry.forgejo_parts();
     let description = source_description(ctx, entry).await.unwrap_or_default();
 
     let (repo, created) = ctx
         .forgejo
-        .create_repo(owner, name, &description)
+        .create_repo(dest.owner, dest.name, &description)
         .await
         .map_err(Failure::forgejo)?;
     if created == CreateOutcome::AlreadyExisted {
         // Someone created it between the lookup and the create call. It gets
         // no special treatment: the existing-repository rules apply.
-        let dst = inspect_existing(ctx, entry, &repo, dest).await?;
+        let dst = inspect_existing(ctx, entry, dest, &repo).await?;
         return Ok((repo, dst));
     }
 
     ctx.forgejo
-        .add_marker(owner, name)
+        .add_marker(dest.owner, dest.name)
         .await
         .map_err(Failure::forgejo)?;
-    set_actions(ctx, entry).await?;
+    set_actions(ctx, entry, dest).await?;
     tracing::info!(forgejo_repo = %entry.forgejo, "created Forgejo repository");
 
     Ok((repo, RemoteState::default()))
@@ -566,14 +569,13 @@ async fn provision(
 
 /// Sets the Actions unit to the entry's `actions` value. Forgejo enables
 /// Actions on new repositories and would run the mirrored workflows.
-async fn set_actions(ctx: &SyncContext, entry: &RepoEntry) -> Result<(), Failure> {
-    let (owner, name) = entry.forgejo_parts();
+async fn set_actions(ctx: &SyncContext, entry: &RepoEntry, dest: &Dest<'_>) -> Result<(), Failure> {
     let actions = RepoEdit {
         has_actions: Some(entry.actions),
         ..RepoEdit::default()
     };
     ctx.forgejo
-        .edit_repo(owner, name, &actions)
+        .edit_repo(dest.owner, dest.name, &actions)
         .await
         .map_err(Failure::forgejo)
 }
@@ -602,11 +604,11 @@ async fn source_description(ctx: &SyncContext, entry: &RepoEntry) -> Option<Stri
 async fn reconcile_metadata(
     ctx: &SyncContext,
     entry: &RepoEntry,
+    dest: &Dest<'_>,
     dest_repo: &DestRepo,
     source_head: Option<&str>,
     present: &RefMap,
 ) -> Result<(), Failure> {
-    let (owner, name) = entry.forgejo_parts();
     let mut edit = RepoEdit::default();
 
     if let Some(branch) = source_head
@@ -622,7 +624,7 @@ async fn reconcile_metadata(
     }
 
     ctx.forgejo
-        .edit_repo(owner, name, &edit)
+        .edit_repo(dest.owner, dest.name, &edit)
         .await
         .map_err(|error| Failure::new(ErrorKind::Metadata, error))
 }

@@ -2,14 +2,13 @@
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use reqwest::header::{ACCEPT, HeaderMap};
+use reqwest::header::{ACCEPT, AUTHORIZATION, HeaderMap};
 use reqwest::{Method, StatusCode};
 use serde::Deserialize;
 use tracing::field::Empty;
 
 use super::{
-    ForgeError, Raw, auth_header, authorized, build_url, decode, ensure_success, execute,
-    retry_after_header,
+    ForgeError, Raw, auth_header, build_url, decode, ensure_success, execute, retry_after_header,
 };
 use crate::config::Token;
 
@@ -57,7 +56,7 @@ impl GithubClient {
             .request(Method::GET, url)
             .header(ACCEPT, "application/vnd.github+json");
         if let Some(token) = &self.token {
-            req = authorized(req, auth_header("Bearer", token, ROUTE_REPO)?);
+            req = req.header(AUTHORIZATION, auth_header("Bearer", token, ROUTE_REPO)?);
         }
         let span = tracing::info_span!(
             "github.api",

@@ -6,7 +6,7 @@
 //!
 //! # Lifecycle
 //!
-//! `Telemetry::init` installs the global `tracing` subscriber and returns a
+//! `init` installs the global `tracing` subscriber and returns a
 //! `TelemetryGuard`. Keep the guard alive for the whole run and call
 //! `TelemetryGuard::shutdown` (or drop it) before the process exits so the
 //! last spans are flushed. Shutdown blocks the calling thread for up to
@@ -15,12 +15,13 @@
 //! async code prefer `tokio::task::spawn_blocking` or do it after the runtime
 //! has finished. DogStatsD sends are unbuffered, so metrics need no flush.
 
+pub mod dogstatsd;
 pub mod logging;
 pub mod metrics;
 pub mod tracing;
 
 use std::io;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use ::tracing::Dispatch;
@@ -29,11 +30,11 @@ use tracing_subscriber::fmt::MakeWriter;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::{EnvFilter, Layer, Registry};
 
+use crate::util::lock;
+
+pub use dogstatsd::{ConstTags, DogstatsdMetrics, DogstatsdTarget};
 pub use logging::JsonLogLayer;
-pub use metrics::{
-    ConstTags, DogstatsdMetrics, DogstatsdTarget, METRIC_NAMES, Metrics, NoopMetrics,
-    RecordingMetrics,
-};
+pub use metrics::{METRIC_NAMES, Metrics, NoopMetrics, RecordingMetrics};
 
 /// Log output format.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -74,7 +75,7 @@ pub struct Settings {
     pub log_format: LogFormat,
     /// `FERRY_LOG_LEVEL`, an env-filter directive, default `info`.
     pub log_level: String,
-    /// Problems found while reading the environment; logged by `Telemetry::build`.
+    /// Problems found while reading the environment; logged by `build`.
     pub warnings: Vec<String>,
 }
 
@@ -129,13 +130,10 @@ impl Settings {
     }
 }
 
-/// Entry point for telemetry setup.
-pub struct Telemetry;
-
 type Base = Registry;
 
 /// Assembles the subscriber: the log layer behind the level filter, and the
-/// trace layer when a provider exists. `Telemetry::build` uses it, and tests
+/// trace layer when a provider exists. `build` uses it, and tests
 /// use it with an in-memory provider so that they exercise the same layering.
 ///
 /// The level filter belongs to the log layer alone. As a global filter it
@@ -176,15 +174,36 @@ const EXPORTER_LOG_INTERVAL: Duration = Duration::from_secs(60);
 fn exporter_throttle<S>(
     interval: Duration,
 ) -> impl Fn(&::tracing::Metadata<'_>, &tracing_subscriber::layer::Context<'_, S>) -> bool {
-    let last = Mutex::new(None::<Instant>);
+    let throttle = Throttle::new(interval);
     move |meta, _| {
         let from_exporter = meta.target().starts_with("libdd_")
             || meta.target().starts_with("datadog_opentelemetry");
         if !from_exporter || meta.is_span() {
             return true;
         }
-        let mut last = last.lock().unwrap_or_else(PoisonError::into_inner);
-        let due = last.is_none_or(|at| at.elapsed() >= interval);
+        throttle.ready()
+    }
+}
+
+/// Lets one call per `interval` through.
+#[derive(Debug)]
+pub(crate) struct Throttle {
+    interval: Duration,
+    last: Mutex<Option<Instant>>,
+}
+
+impl Throttle {
+    pub(crate) fn new(interval: Duration) -> Self {
+        Self {
+            interval,
+            last: Mutex::new(None),
+        }
+    }
+
+    /// True for the first call and then at most once per interval.
+    pub(crate) fn ready(&self) -> bool {
+        let mut last = lock(&self.last);
+        let due = last.is_none_or(|at| at.elapsed() >= self.interval);
         if due {
             *last = Some(Instant::now());
         }
@@ -196,51 +215,53 @@ fn exporter_throttle<S>(
 /// whatever the log level is.
 const TRACE_LEVEL: LevelFilter = LevelFilter::INFO;
 
-impl Telemetry {
-    /// Installs the global subscriber (level filter, JSON or text logs on
-    /// stdout, and the OpenTelemetry layer when tracing is enabled) and builds
-    /// the metrics backend. Call once, early, inside the tokio runtime or not.
-    ///
-    /// If a global subscriber already exists, the existing one stays and a
-    /// note goes to stderr; metrics and tracing still work.
-    pub fn init(settings: Settings) -> TelemetryGuard {
-        let (guard, dispatch) = Self::build(settings, io::stdout);
-        if ::tracing::dispatcher::set_global_default(dispatch).is_err() {
-            eprintln!("ferry: a global tracing subscriber is already installed; keeping it");
-        }
-        guard
+/// Installs the global subscriber (level filter, JSON or text logs on
+/// stdout, and the OpenTelemetry layer when tracing is enabled) and builds
+/// the metrics backend. Call once, early, inside the tokio runtime or not.
+///
+/// If a global subscriber already exists, the existing one stays and a
+/// note goes to stderr; metrics and tracing still work.
+pub fn init(settings: Settings) -> TelemetryGuard {
+    let (guard, dispatch) = build(settings, io::stdout);
+    if ::tracing::dispatcher::set_global_default(dispatch).is_err() {
+        eprintln!("ferry: a global tracing subscriber is already installed; keeping it");
     }
+    guard
+}
 
-    /// Builds the guard and the subscriber without installing anything
-    /// globally. `init` calls this with stdout; tests call it with a capturing
-    /// writer and install the `Dispatch` with `tracing::dispatcher::with_default`.
-    pub fn build<W>(settings: Settings, writer: W) -> (TelemetryGuard, Dispatch)
-    where
-        W: for<'w> MakeWriter<'w> + Send + Sync + 'static,
-    {
-        let mut warnings = settings.warnings.clone();
+/// Builds the guard and the subscriber without installing anything
+/// globally. `init` calls this with stdout; tests call it with a capturing
+/// writer and install the `Dispatch` with `tracing::dispatcher::with_default`.
+pub fn build<W>(settings: Settings, writer: W) -> (TelemetryGuard, Dispatch)
+where
+    W: for<'w> MakeWriter<'w> + Send + Sync + 'static,
+{
+    let mut warnings = settings.warnings.clone();
+    let tags = settings.const_tags();
 
-        let filter = EnvFilter::try_new(&settings.log_level).unwrap_or_else(|error| {
-            warnings.push(format!(
-                "FERRY_LOG_LEVEL={:?} is not a valid filter ({error}); using info",
-                settings.log_level
-            ));
-            EnvFilter::new("info")
-        });
+    let filter = EnvFilter::try_new(&settings.log_level).unwrap_or_else(|error| {
+        warnings.push(format!(
+            "FERRY_LOG_LEVEL={:?} is not a valid filter ({error}); using info",
+            settings.log_level
+        ));
+        EnvFilter::new("info")
+    });
 
-        let provider = settings.trace_agent_url.as_deref().and_then(|raw| {
-            match tracing::parse_agent_url(raw) {
-                Ok(url) => Some(tracing::build_datadog_provider(&settings, &url)),
+    let provider =
+        settings
+            .trace_agent_url
+            .as_deref()
+            .and_then(|raw| match tracing::parse_agent_url(raw) {
+                Ok(url) => Some(tracing::build_datadog_provider(&tags, &url)),
                 Err(error) => {
                     warnings.push(format!(
                         "DD_TRACE_AGENT_URL={raw:?} is invalid ({error}); tracing is disabled"
                     ));
                     None
                 }
-            }
-        });
+            });
 
-        let metrics: Option<Arc<dyn Metrics>> = settings.dogstatsd_url.as_deref().and_then(|raw| {
+    let metrics: Option<Arc<dyn Metrics>> = settings.dogstatsd_url.as_deref().and_then(|raw| {
             let target = match DogstatsdTarget::parse(raw) {
                 Ok(target) => target,
                 Err(error) => {
@@ -250,45 +271,38 @@ impl Telemetry {
                     return None;
                 }
             };
-            match DogstatsdMetrics::connect(&target, &settings.const_tags()) {
+            match DogstatsdMetrics::connect(&target, &tags) {
                 Ok(metrics) => Some(Arc::new(metrics) as Arc<dyn Metrics>),
                 Err(error) => {
                     warnings.push(format!(
-                        "DogStatsD setup failed ({error}); metrics are disabled"
+                        "DogStatsD setup failed (cannot create DogStatsD socket: {error}); metrics are disabled"
                     ));
                     None
                 }
             }
         });
 
-        let log_layer: Box<dyn Layer<Base> + Send + Sync> = match settings.log_format {
-            LogFormat::Json => JsonLogLayer::new(
-                writer,
-                settings.service.clone(),
-                settings.env.clone(),
-                settings.version.clone(),
-            )
+    let log_layer: Box<dyn Layer<Base> + Send + Sync> = match settings.log_format {
+        LogFormat::Json => JsonLogLayer::new(writer, tags.clone()).boxed(),
+        LogFormat::Text => tracing_subscriber::fmt::layer()
+            .with_writer(writer)
+            .with_ansi(false)
             .boxed(),
-            LogFormat::Text => tracing_subscriber::fmt::layer()
-                .with_writer(writer)
-                .with_ansi(false)
-                .boxed(),
-        };
-        let dispatch = compose(log_layer, filter, provider.as_ref());
+    };
+    let dispatch = compose(log_layer, filter, provider.as_ref());
 
-        ::tracing::dispatcher::with_default(&dispatch, || {
-            for warning in &warnings {
-                ::tracing::warn!("telemetry: {warning}");
-            }
-        });
+    ::tracing::dispatcher::with_default(&dispatch, || {
+        for warning in &warnings {
+            ::tracing::warn!("telemetry: {warning}");
+        }
+    });
 
-        let guard = TelemetryGuard {
-            metrics_enabled: metrics.is_some(),
-            metrics: metrics.unwrap_or_else(|| Arc::new(NoopMetrics)),
-            provider,
-        };
-        (guard, dispatch)
-    }
+    let guard = TelemetryGuard {
+        metrics_enabled: metrics.is_some(),
+        metrics: metrics.unwrap_or_else(|| Arc::new(NoopMetrics)),
+        provider,
+    };
+    (guard, dispatch)
 }
 
 /// Owns the telemetry backends. Dropping it shuts them down.

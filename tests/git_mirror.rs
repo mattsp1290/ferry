@@ -2,44 +2,19 @@
 //!
 //! LFS cases run only when `FERRY_TEST_LFS=1` is set.
 
-use std::os::unix::fs::PermissionsExt;
+mod support;
+
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
 
-use ferry::config::TokenFiles;
 use ferry::git::{Git, GitErrorKind, GitRunner, GitSettings, Remote, Side};
 use nix::sys::signal::kill;
 use nix::unistd::Pid;
 use tempfile::TempDir;
 use tokio_util::sync::CancellationToken;
 
-/// Runs plain `git` hermetically and returns trimmed stdout.
-fn git(dir: &Path, args: &[&str]) -> String {
-    let output = Command::new("git")
-        .args(args)
-        .current_dir(dir)
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("HOME", dir)
-        .env("GIT_AUTHOR_NAME", "Test")
-        .env("GIT_AUTHOR_EMAIL", "test@example.invalid")
-        .env("GIT_COMMITTER_NAME", "Test")
-        .env("GIT_COMMITTER_EMAIL", "test@example.invalid")
-        .output()
-        .expect("git runs");
-    assert!(
-        output.status.success(),
-        "git {args:?} failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    String::from_utf8_lossy(&output.stdout).trim().to_string()
-}
-
-fn file_url(path: &Path) -> String {
-    format!("file://{}", path.display())
-}
+use support::{file_url, git, git_settings, write_script};
 
 fn remote(path: &Path) -> Remote {
     Remote {
@@ -50,17 +25,11 @@ fn remote(path: &Path) -> Remote {
 
 fn settings(tmp: &Path, timeout: Duration, cancel: CancellationToken) -> GitSettings {
     GitSettings {
-        cache_dir: tmp.join("ferry-cache-dir"),
-        timeout,
-        kill_grace: Duration::from_millis(500),
-        token_files: TokenFiles::default(),
         github_host: "github.com".into(),
         forgejo_host: "forge.invalid".into(),
         forgejo_user: "ferry".into(),
         secrets: Vec::new(),
-        askpass_path: env!("CARGO_BIN_EXE_ferry").into(),
-        git_program: "git".into(),
-        cancel,
+        ..git_settings(tmp.join("ferry-cache-dir"), timeout, cancel)
     }
 }
 
@@ -204,8 +173,7 @@ async fn pull_refs_are_not_fetched_or_pushed() {
 /// Writes an executable shell script that stands in for `git`.
 fn fake_git(dir: &Path, name: &str, body: &str) -> PathBuf {
     let path = dir.join(name);
-    std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    write_script(&path, body);
     path
 }
 

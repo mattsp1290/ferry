@@ -1,6 +1,5 @@
 //! Askpass mode through the built binary, and real git reaching it.
 
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::{Arc, Mutex};
@@ -11,6 +10,10 @@ use ferry::git::{Git, GitErrorKind, GitRunner, GitSettings, Remote, Side};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
+
+mod support;
+
+use support::{git_settings, stdout, write_script};
 
 const GITHUB_TOKEN: &str = "github-token-not-real";
 const FORGEJO_TOKEN: &str = "test-token-not-real";
@@ -53,10 +56,6 @@ impl Env {
             .output()
             .expect("binary runs")
     }
-}
-
-fn stdout(output: &Output) -> String {
-    String::from_utf8_lossy(&output.stdout).into_owned()
 }
 
 #[test]
@@ -199,9 +198,6 @@ async fn spawn_401_server() -> (u16, Arc<Mutex<Vec<String>>>) {
 fn runner_for(port: u16, github_side: bool, env: &Env, secrets: Vec<Token>) -> GitRunner {
     let host = format!("127.0.0.1:{port}");
     GitRunner::new(GitSettings {
-        cache_dir: env._tmp.path().join("cache"),
-        timeout: Duration::from_secs(30),
-        kill_grace: Duration::from_millis(500),
         token_files: TokenFiles {
             github: Some(env.github_file.clone()),
             forgejo: Some(env.forgejo_file.clone()),
@@ -216,11 +212,12 @@ fn runner_for(port: u16, github_side: bool, env: &Env, secrets: Vec<Token>) -> G
         } else {
             host
         },
-        forgejo_user: "ferry".into(),
         secrets,
-        askpass_path: env!("CARGO_BIN_EXE_ferry").into(),
-        git_program: "git".into(),
-        cancel: CancellationToken::new(),
+        ..git_settings(
+            env._tmp.path().join("cache"),
+            Duration::from_secs(30),
+            CancellationToken::new(),
+        )
     })
 }
 
@@ -277,12 +274,10 @@ fn base64_helper_matches_known_vectors() {
 async fn stderr_containing_a_token_is_redacted_in_errors() {
     let env = Env::new();
     let script = env._tmp.path().join("fake-git");
-    std::fs::write(
+    write_script(
         &script,
-        format!("#!/bin/sh\necho \"fatal: leaked {FORGEJO_TOKEN} here\" >&2\nexit 128\n"),
-    )
-    .unwrap();
-    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        &format!("echo \"fatal: leaked {FORGEJO_TOKEN} here\" >&2\nexit 128"),
+    );
 
     let runner = runner_for(1, false, &env, vec![Token::new(FORGEJO_TOKEN)]);
     let mut settings = runner.settings().clone();

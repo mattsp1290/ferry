@@ -16,14 +16,13 @@ use tokio_util::sync::CancellationToken;
 
 use crate::cli::exit;
 use crate::config::{Config, ConfigError, RepoEntry, TokenFiles, Tokens};
+use crate::emitter::{EmitterConfig, run_emitter};
 use crate::forge::{ForgejoClient, GithubClient, http_client};
 use crate::git::{Git, GitErrorKind, GitRunner};
 use crate::health::{self, HealthState};
-use crate::scheduler::{
-    EmitterConfig, Scheduler, SchedulerConfig, SharedStatus, Syncer, run_emitter, run_once,
-};
-use crate::sync::{RepoSyncer, SyncContext};
-use crate::telemetry::{Metrics, Settings, Telemetry};
+use crate::scheduler::{Scheduler, SchedulerConfig, SharedStatus, Syncer, run_once};
+use crate::sync::SyncContext;
+use crate::telemetry::{self, Metrics, Settings};
 
 /// How long process exit waits for blocking tasks that are still running.
 const RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
@@ -99,7 +98,7 @@ enum Mode {
 }
 
 fn execute(config: Config, entries: Vec<RepoEntry>, mode: Mode) -> u8 {
-    let mut telemetry = Telemetry::init(Settings::from_env());
+    let mut telemetry = telemetry::init(Settings::from_env());
     let metrics = telemetry.metrics();
 
     let result = tokio::runtime::Builder::new_multi_thread()
@@ -148,7 +147,7 @@ async fn start(
     check_cache_dir(config).await?;
     check_tools(&runner, &entries).await?;
 
-    let syncer = Arc::new(RepoSyncer::new(sync_context(config, runner, &tokens)?));
+    let syncer = Arc::new(sync_context(config, runner, &tokens)?);
     match mode {
         Mode::Run => serve(config, entries, syncer, metrics, cancel_syncs).await,
         Mode::Once => once(config, entries, syncer, metrics, cancel_syncs).await,

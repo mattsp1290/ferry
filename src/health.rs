@@ -22,6 +22,8 @@ use tokio::net::TcpListener;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
+use crate::util::lock;
+
 /// A heartbeat older than this fails liveness.
 pub const LIVENESS_WINDOW: Duration = Duration::from_secs(60);
 
@@ -44,20 +46,12 @@ impl HealthState {
 
     /// Records a scheduler tick. Only the scheduler loop calls this.
     pub fn beat(&self) {
-        *self
-            .inner
-            .last_beat
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Instant::now());
+        *lock(&self.inner.last_beat) = Some(Instant::now());
     }
 
     /// Time since the last `beat`, or `None` before the first one.
     pub fn heartbeat_age(&self) -> Option<Duration> {
-        let last = *self
-            .inner
-            .last_beat
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let last = *lock(&self.inner.last_beat);
         last.map(|at| Instant::now().saturating_duration_since(at))
     }
 

@@ -96,8 +96,8 @@ The cache repository stores no remote and no credential.
 | Item | Result | Evidence |
 |---|---|---|
 | 1. Versions resolve without duplicates | pass | `cargo tree -d` lists no `opentelemetry*` crate |
-| 2. A `tracing` span reaches the Datadog exporter | pass | `tests/telemetry.rs`: `datadog_provider_exports_to_an_http_agent` |
-| 3. `http://` and `unix://` agent URLs | pass | same file: `…_http_agent`, `…_unix_socket_agent` |
+| 2. A `tracing` span reaches the Datadog exporter | pass | `tests/trace_export.rs`: `datadog_provider_exports_to_an_http_agent` |
+| 3. `http://` and `unix://` agent URLs | pass | `tests/trace_export.rs`: `datadog_provider_exports_to_an_http_agent`, `datadog_provider_exports_to_a_unix_socket_agent` |
 | 4. Correlation ID encoding | recorded above | `json_log_flattens_span_fields_and_adds_dd_ids_matching_the_exported_span` |
 | 5. `cargo zigbuild` for `x86_64-unknown-linux-gnu.2.36` | pass | `scripts/build-binaries.sh` on macOS arm64 |
 | 6. A span arrives in Datadog through the real Agent | **not run** | needs gate G1 (`pup auth login`) and a port-forward to the Agent |

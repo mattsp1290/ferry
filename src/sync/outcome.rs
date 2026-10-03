@@ -126,6 +126,21 @@ impl SyncOutcome {
         }
     }
 
+    /// Sets the ref counts. Builder-style, for the outcomes of finished passes.
+    #[must_use]
+    pub fn with_refs(mut self, changed: u32, pruned: u32) -> Self {
+        self.refs_changed = changed;
+        self.refs_pruned = pruned;
+        self
+    }
+
+    /// Sets how long the forge asked ferry to wait.
+    #[must_use]
+    pub fn with_retry_after(mut self, retry_after: Option<Duration>) -> Self {
+        self.retry_after = retry_after;
+        self
+    }
+
     /// The `error_kind` tag value: the kind, or `none` when not an error.
     pub fn error_kind_tag(&self) -> &'static str {
         self.error_kind.map_or("none", ErrorKind::as_str)

@@ -184,28 +184,24 @@ else
   skip "integer --set override (no ferry binary)"
 fi
 
-# Required values and validation fail with a message naming the value.
-if helm template ferry "$chart" --set image.repository=x >"$work/nodigest.out" 2>&1; then
-  fail "missing image.digest fails the render"
-elif grep -q 'image.digest' "$work/nodigest.out"; then
-  ok "missing image.digest fails the render and names image.digest"
-else
-  fail "missing image.digest error does not name image.digest"
-fi
-if helm template ferry "$chart" --set image.digest=sha256:0 >"$work/norepo.out" 2>&1; then
-  fail "missing image.repository fails the render"
-elif grep -q 'image.repository' "$work/norepo.out"; then
-  ok "missing image.repository fails the render and names image.repository"
-else
-  fail "missing image.repository error does not name image.repository"
-fi
-if helm template ferry "$chart" "${common[@]}" --set datadog.transport=carrier-pigeon >"$work/badtransport.out" 2>&1; then
-  fail "invalid datadog.transport fails the render"
-elif grep -q 'datadog.transport' "$work/badtransport.out"; then
-  ok "invalid datadog.transport fails the render and names datadog.transport"
-else
-  fail "invalid datadog.transport error does not name datadog.transport"
-fi
+# check_render_fails <value-name> <helm args...>: the render must fail, and
+# the error must name the value so the operator knows what to set.
+check_render_fails() {
+  local value=$1
+  shift
+  local out="$work/render-fails.out"
+  if helm template ferry "$chart" "$@" >"$out" 2>&1; then
+    fail "bad $value fails the render"
+  elif grep -q "$value" "$out"; then
+    ok "bad $value fails the render and names $value"
+  else
+    fail "bad $value error does not name $value"
+  fi
+}
+
+check_render_fails image.digest --set image.repository=x
+check_render_fails image.repository --set image.digest=sha256:0
+check_render_fails datadog.transport "${common[@]}" --set datadog.transport=carrier-pigeon
 
 if [ "$failures" -ne 0 ]; then
   echo "$failures assertion(s) failed"

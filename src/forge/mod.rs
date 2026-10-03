@@ -12,7 +12,7 @@ pub mod github;
 use std::error::Error as _;
 use std::time::Duration;
 
-use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
+use reqwest::header::{HeaderMap, HeaderValue};
 use reqwest::{RequestBuilder, StatusCode};
 use serde::de::DeserializeOwned;
 use thiserror::Error;
@@ -20,6 +20,7 @@ use tracing::{Instrument, Span};
 use url::Url;
 
 use crate::config::Token;
+use crate::util::truncate_at_char_boundary;
 
 pub use forgejo::{CreateOutcome, DestRepo, ForgejoClient, MARKER_TOPIC, RepoEdit};
 pub use github::{GithubClient, SourceMeta};
@@ -127,10 +128,6 @@ pub(crate) fn auth_header(
     Ok(value)
 }
 
-pub(crate) fn authorized(req: RequestBuilder, value: HeaderValue) -> RequestBuilder {
-    req.header(AUTHORIZATION, value)
-}
-
 /// Send `req` inside `span` and read the whole response.
 pub(crate) async fn execute(
     req: RequestBuilder,
@@ -173,18 +170,8 @@ fn network_error(route: &'static str, error: reqwest::Error) -> ForgeError {
         message.push_str(&cause.to_string());
         source = cause.source();
     }
-    truncate(&mut message);
+    truncate_at_char_boundary(&mut message, BODY_EXCERPT_MAX);
     ForgeError::Network { route, message }
-}
-
-fn truncate(message: &mut String) {
-    if message.len() > BODY_EXCERPT_MAX {
-        let mut end = BODY_EXCERPT_MAX;
-        while !message.is_char_boundary(end) {
-            end -= 1;
-        }
-        message.truncate(end);
-    }
 }
 
 /// A short, single-line excerpt of a response body.
@@ -193,7 +180,7 @@ fn excerpt(body: &[u8]) -> String {
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ");
-    truncate(&mut text);
+    truncate_at_char_boundary(&mut text, BODY_EXCERPT_MAX);
     text
 }
 

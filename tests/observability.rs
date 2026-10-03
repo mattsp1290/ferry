@@ -8,17 +8,16 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use ferry::config::RepoEntry;
+use ferry::emitter::{EmitterConfig, run_emitter};
 use ferry::health::HealthState;
-use ferry::scheduler::{
-    EmitterConfig, Scheduler, SchedulerConfig, SharedStatus, Syncer, run_emitter, run_once,
-};
+use ferry::scheduler::{Scheduler, SchedulerConfig, SharedStatus, Syncer, run_once};
 use ferry::sync::{ErrorKind, SyncOutcome, SyncResult, sync_repo};
 use ferry::telemetry::logging::dd_ids;
 use ferry::telemetry::metrics::MetricEvent;
-use ferry::telemetry::{Metrics, NoopMetrics, RecordingMetrics, Settings, Telemetry};
+use ferry::telemetry::{self, Metrics, NoopMetrics, RecordingMetrics, Settings};
 use opentelemetry::trace::{SpanId, Status};
 use opentelemetry_sdk::trace::SpanData;
-use support::capture::{Capture, attr_str, json_dispatch, memory_provider};
+use support::capture::{Capture, attr_str, scoped_json_capture};
 use support::{FORGEJO_TOKEN, GITHUB_TOKEN, World};
 use tokio_util::sync::CancellationToken;
 
@@ -37,9 +36,7 @@ async fn one_sync_is_one_trace_with_a_span_for_each_step_that_ran() {
     let world = World::new().await;
     let entry = World::entry("alpha");
     world.source(&entry);
-    let capture = Capture::default();
-    let (provider, exporter) = memory_provider();
-    let _subscriber = tracing::dispatcher::set_default(&json_dispatch(&capture, &provider));
+    let (_capture, exporter, _subscriber) = scoped_json_capture();
 
     let outcome = sync_repo(&world.context(), &entry).await;
     assert_eq!(outcome.result, SyncResult::Synced, "{outcome:?}");
@@ -114,9 +111,7 @@ async fn one_sync_is_one_trace_with_a_span_for_each_step_that_ran() {
 async fn an_error_outcome_marks_the_sync_span_as_an_error() {
     let world = World::new().await;
     let entry = World::entry("missing");
-    let capture = Capture::default();
-    let (provider, exporter) = memory_provider();
-    let _subscriber = tracing::dispatcher::set_default(&json_dispatch(&capture, &provider));
+    let (capture, exporter, _subscriber) = scoped_json_capture();
 
     let outcome = sync_repo(&world.context(), &entry).await;
     assert_eq!(outcome.error_kind, Some(ErrorKind::SourceMissing));
@@ -153,9 +148,7 @@ async fn the_result_log_line_carries_the_trace_id_of_its_sync() {
     let world = World::new().await;
     let entry = World::entry("alpha");
     world.source(&entry);
-    let capture = Capture::default();
-    let (provider, exporter) = memory_provider();
-    let _subscriber = tracing::dispatcher::set_default(&json_dispatch(&capture, &provider));
+    let (capture, exporter, _subscriber) = scoped_json_capture();
 
     let ctx = world.context();
     sync_repo(&ctx, &entry).await;
@@ -203,9 +196,7 @@ async fn no_token_reaches_a_metric_a_log_line_or_a_span() {
     world.source(&unmanaged);
     world.existing_dest(&unmanaged, support::FakeRepo::default());
     world.seed_dest(&unmanaged, &source);
-    let capture = Capture::default();
-    let (provider, exporter) = memory_provider();
-    let _subscriber = tracing::dispatcher::set_default(&json_dispatch(&capture, &provider));
+    let (capture, exporter, _subscriber) = scoped_json_capture();
     let metrics = RecordingMetrics::new();
 
     let ctx = world.context();
@@ -233,7 +224,7 @@ async fn sync_completes_with_telemetry_disabled() {
     let world = World::new().await;
     let entry = World::entry("alpha");
     let source = world.source(&entry);
-    let (guard, dispatch) = Telemetry::build(Settings::default(), Capture::default());
+    let (guard, dispatch) = telemetry::build(Settings::default(), Capture::default());
     assert!(!guard.metrics_enabled());
     assert!(!guard.tracing_enabled());
     let _subscriber = tracing::dispatcher::set_default(&dispatch);
@@ -409,17 +400,15 @@ async fn cache_size_is_measured_at_most_once_per_scan_interval() {
         shutdown.clone(),
     ));
 
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    while metrics
-        .events()
-        .iter()
-        .filter(|event| matches!(event, MetricEvent::ReposConfigured(0)))
-        .count()
-        < 5
-    {
-        assert!(std::time::Instant::now() < deadline, "the emitter stalled");
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    support::wait_until("the emitter to tick", Duration::from_secs(10), || {
+        metrics
+            .events()
+            .iter()
+            .filter(|event| matches!(event, MetricEvent::ReposConfigured(0)))
+            .count()
+            >= 5
+    })
+    .await;
     shutdown.cancel();
     emitter.await.expect("emitter exits");
 

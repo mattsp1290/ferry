@@ -7,18 +7,18 @@
 //! URL, or `.git/config`.
 
 pub mod askpass;
+mod error;
 pub mod refs;
 
 use std::ffi::OsString;
-use std::fmt;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
+use std::process::{ExitStatus, Stdio};
 use std::time::Duration;
 
 use nix::sys::signal::{Signal, killpg};
 use nix::unistd::Pid;
 use tokio::io::{AsyncRead, AsyncReadExt};
-use tokio::process::Command;
+use tokio::process::{Child, Command};
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, Span, field};
 use url::Url;
@@ -26,10 +26,9 @@ use url::Url;
 use crate::config::{
     Config, FORGEJO_TOKEN_FILE_ENV, GITHUB_TOKEN_FILE_ENV, Token, TokenFiles, Tokens,
 };
+pub use error::{GitError, GitErrorKind, STDERR_LIMIT, classify, sanitize_stderr};
 pub use refs::{RefMap, RemoteState};
 
-/// Captured stderr is cut to this many bytes before it enters an error.
-pub const STDERR_LIMIT: usize = 4096;
 /// Default wait between SIGTERM and SIGKILL.
 pub const DEFAULT_KILL_GRACE: Duration = Duration::from_secs(10);
 
@@ -61,131 +60,6 @@ impl Side {
 pub struct Remote {
     pub url: String,
     pub side: Side,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum GitErrorKind {
-    Timeout,
-    Cancelled,
-    Auth,
-    NotFound,
-    Rejected,
-    Network,
-    Other,
-}
-
-impl GitErrorKind {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Timeout => "timeout",
-            Self::Cancelled => "cancelled",
-            Self::Auth => "auth",
-            Self::NotFound => "not_found",
-            Self::Rejected => "rejected",
-            Self::Network => "network",
-            Self::Other => "other",
-        }
-    }
-}
-
-/// A failed git operation. `stderr` is redacted and truncated, so `Display`
-/// is safe to log.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct GitError {
-    pub kind: GitErrorKind,
-    pub operation: &'static str,
-    pub exit_code: Option<i32>,
-    pub stderr: String,
-}
-
-impl GitError {
-    fn other(operation: &'static str, message: impl Into<String>) -> Self {
-        Self {
-            kind: GitErrorKind::Other,
-            operation,
-            exit_code: None,
-            stderr: message.into(),
-        }
-    }
-}
-
-impl fmt::Display for GitError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "git {} failed ({}", self.operation, self.kind.as_str())?;
-        if let Some(code) = self.exit_code {
-            write!(f, ", exit code {code}")?;
-        }
-        f.write_str(")")?;
-        let stderr = self.stderr.trim();
-        if !stderr.is_empty() {
-            write!(f, ": {stderr}")?;
-        }
-        Ok(())
-    }
-}
-
-impl std::error::Error for GitError {}
-
-/// Replaces every secret value with `[redacted]`, then truncates to
-/// [`STDERR_LIMIT`] bytes on a char boundary. Redacting first means a token
-/// that straddles the cut can never leak a prefix.
-pub fn sanitize_stderr(raw: &[u8], secrets: &[Token]) -> String {
-    let mut text = String::from_utf8_lossy(raw).into_owned();
-    let mut values: Vec<&str> = secrets
-        .iter()
-        .map(Token::expose)
-        .filter(|value| !value.is_empty())
-        .collect();
-    values.sort_by_key(|value| std::cmp::Reverse(value.len()));
-    for value in values {
-        text = text.replace(value, "[redacted]");
-    }
-    if text.len() > STDERR_LIMIT {
-        let mut end = STDERR_LIMIT;
-        while !text.is_char_boundary(end) {
-            end -= 1;
-        }
-        text.truncate(end);
-    }
-    text
-}
-
-/// Maps known stderr fragments to an error kind.
-pub fn classify(stderr: &str) -> GitErrorKind {
-    let has = |needles: &[&str]| needles.iter().any(|needle| stderr.contains(needle));
-    if has(&[
-        "Authentication failed",
-        "terminal prompts disabled",
-        "could not read Username",
-        "could not read Password",
-        "Invalid username or password",
-        "error: 401",
-        "error: 403",
-    ]) {
-        GitErrorKind::Auth
-    } else if has(&[
-        "Repository not found",
-        "does not appear to be a git repository",
-        "error: 404",
-    ]) || (has(&["repository '"]) && has(&["not found"]))
-    {
-        GitErrorKind::NotFound
-    } else if has(&[
-        "[rejected]",
-        "[remote rejected]",
-        "pre-receive hook declined",
-    ]) {
-        GitErrorKind::Rejected
-    } else if has(&[
-        "Could not resolve host",
-        "Connection",
-        "Failed to connect",
-        "Operation timed out",
-    ]) {
-        GitErrorKind::Network
-    } else {
-        GitErrorKind::Other
-    }
 }
 
 /// The host and port of a remote URL, for the askpass host variables.
@@ -268,6 +142,21 @@ pub struct GitRunner {
     settings: GitSettings,
 }
 
+/// An `info` span for one git operation. `git.side` is present when the
+/// operation talks to a remote. `exec` fills in `git.exit_code`.
+macro_rules! git_span {
+    ($name:literal) => {
+        tracing::info_span!($name, git.exit_code = field::Empty)
+    };
+    ($name:literal, $remote:expr) => {
+        tracing::info_span!(
+            $name,
+            git.side = $remote.side.as_str(),
+            git.exit_code = field::Empty
+        )
+    };
+}
+
 impl GitRunner {
     pub fn new(settings: GitSettings) -> Self {
         Self { settings }
@@ -297,10 +186,13 @@ impl GitRunner {
 
     /// Output of `git --version`.
     pub async fn git_version(&self) -> Result<String, GitError> {
-        let span = tracing::info_span!("git.version", git.exit_code = field::Empty);
         let out = self
-            .exec("version", &span, args(["--version"]))
-            .instrument(span.clone())
+            .run(
+                git_span!("git.version"),
+                "version",
+                None,
+                args(["--version"]),
+            )
             .await?;
         Ok(String::from_utf8_lossy(&out).trim().to_string())
     }
@@ -308,10 +200,13 @@ impl GitRunner {
     /// Output of `git lfs version`. Separate so callers require git-lfs only
     /// when an entry needs it.
     pub async fn lfs_version(&self) -> Result<String, GitError> {
-        let span = tracing::info_span!("git.lfs_version", git.exit_code = field::Empty);
         let out = self
-            .exec("lfs_version", &span, args(["lfs", "version"]))
-            .instrument(span.clone())
+            .run(
+                git_span!("git.lfs_version"),
+                "lfs_version",
+                None,
+                args(["lfs", "version"]),
+            )
             .await?;
         Ok(String::from_utf8_lossy(&out).trim().to_string())
     }
@@ -399,6 +294,25 @@ impl GitRunner {
         env
     }
 
+    /// One git operation: rejects a remote URL with userinfo, then runs the
+    /// child inside `span`.
+    async fn run(
+        &self,
+        span: Span,
+        operation: &'static str,
+        remote: Option<&Remote>,
+        argv: Vec<OsString>,
+    ) -> Result<Vec<u8>, GitError> {
+        async {
+            if let Some(remote) = remote {
+                Self::check_remote(operation, remote)?;
+            }
+            self.exec(operation, &span, argv).await
+        }
+        .instrument(span.clone())
+        .await
+    }
+
     /// Runs one git child to completion under the timeout and cancellation
     /// rules and returns its stdout. `span` receives `git.exit_code`.
     async fn exec(
@@ -447,35 +361,15 @@ impl GitRunner {
             .take()
             .map(|pipe| tokio::spawn(read_capped(pipe, STDERR_READ_CAP)));
 
-        enum Ended {
-            Exited(std::io::Result<std::process::ExitStatus>),
-            TimedOut,
-            Cancelled,
-        }
-        let ended = tokio::select! {
-            status = child.wait() => Ended::Exited(status),
-            () = tokio::time::sleep(s.timeout) => Ended::TimedOut,
-            () = s.cancel.cancelled() => Ended::Cancelled,
+        let ended: Result<std::io::Result<ExitStatus>, GitErrorKind> = tokio::select! {
+            status = child.wait() => Ok(status),
+            () = tokio::time::sleep(s.timeout) => Err(GitErrorKind::Timeout),
+            () = s.cancel.cancelled() => Err(GitErrorKind::Cancelled),
         };
-
         let (kind, status) = match ended {
-            Ended::Exited(status) => (None, status.ok()),
-            Ended::TimedOut | Ended::Cancelled => {
-                if let Some(group) = group {
-                    let _ = killpg(group, Signal::SIGTERM);
-                }
-                let _ = tokio::time::timeout(s.kill_grace, child.wait()).await;
-                // The leader may have exited while helpers linger, so always
-                // finish the group off.
-                if let Some(group) = group {
-                    let _ = killpg(group, Signal::SIGKILL);
-                }
-                let _ = child.wait().await;
-                let kind = if matches!(ended, Ended::TimedOut) {
-                    GitErrorKind::Timeout
-                } else {
-                    GitErrorKind::Cancelled
-                };
+            Ok(status) => (None, status.ok()),
+            Err(kind) => {
+                terminate(&mut child, group, s.kill_grace).await;
                 (Some(kind), None)
             }
         };
@@ -513,6 +407,21 @@ impl GitRunner {
             }),
         }
     }
+}
+
+/// Stops a child that timed out or was cancelled: SIGTERM to its process
+/// group, `grace` to exit, then SIGKILL.
+async fn terminate(child: &mut Child, group: Option<Pid>, grace: Duration) {
+    if let Some(group) = group {
+        let _ = killpg(group, Signal::SIGTERM);
+    }
+    let _ = tokio::time::timeout(grace, child.wait()).await;
+    // The leader may have exited while helpers linger, so always finish the
+    // group off.
+    if let Some(group) = group {
+        let _ = killpg(group, Signal::SIGKILL);
+    }
+    let _ = child.wait().await;
 }
 
 fn args<const N: usize>(items: [&str; N]) -> Vec<OsString> {
@@ -570,31 +479,23 @@ async fn join_pipe(task: Option<tokio::task::JoinHandle<Captured>>) -> Captured 
 #[async_trait::async_trait]
 impl Git for GitRunner {
     async fn ls_remote(&self, remote: &Remote) -> Result<RemoteState, GitError> {
-        let span = tracing::info_span!(
-            "git.ls_remote",
-            git.side = remote.side.as_str(),
-            git.exit_code = field::Empty
-        );
-        async {
-            Self::check_remote("ls_remote", remote)?;
-            let out = self
-                .exec(
-                    "ls_remote",
-                    &span,
-                    args([
-                        "ls-remote",
-                        "--symref",
-                        &remote.url,
-                        "HEAD",
-                        "refs/heads/*",
-                        "refs/tags/*",
-                    ]),
-                )
-                .await?;
-            Ok(refs::parse_ls_remote(&String::from_utf8_lossy(&out)))
-        }
-        .instrument(span.clone())
-        .await
+        let argv = args([
+            "ls-remote",
+            "--symref",
+            &remote.url,
+            "HEAD",
+            "refs/heads/*",
+            "refs/tags/*",
+        ]);
+        let out = self
+            .run(
+                git_span!("git.ls_remote", remote),
+                "ls_remote",
+                Some(remote),
+                argv,
+            )
+            .await?;
+        Ok(refs::parse_ls_remote(&String::from_utf8_lossy(&out)))
     }
 
     async fn ensure_cache(&self, path: &Path) -> Result<(), GitError> {
@@ -639,172 +540,70 @@ impl Git for GitRunner {
     }
 
     async fn fetch(&self, path: &Path, remote: &Remote) -> Result<(), GitError> {
-        let span = tracing::info_span!(
-            "git.fetch",
-            git.side = remote.side.as_str(),
-            git.exit_code = field::Empty
-        );
-        async {
-            Self::check_remote("fetch", remote)?;
-            let mut argv = Self::cache_args(path, ["fetch", "--force", "--prune", "--no-tags"]);
-            argv.push((&remote.url).into());
-            argv.extend(FETCH_REFSPECS.iter().map(OsString::from));
-            self.exec("fetch", &span, argv).await.map(|_| ())
-        }
-        .instrument(span.clone())
-        .await
+        let mut argv = Self::cache_args(path, ["fetch", "--force", "--prune", "--no-tags"]);
+        argv.push((&remote.url).into());
+        argv.extend(FETCH_REFSPECS.iter().map(OsString::from));
+        self.run(git_span!("git.fetch", remote), "fetch", Some(remote), argv)
+            .await
+            .map(|_| ())
     }
 
     async fn local_refs(&self, path: &Path) -> Result<RefMap, GitError> {
-        let span = tracing::info_span!("git.local_refs", git.exit_code = field::Empty);
-        async {
-            let out = self
-                .exec(
-                    "local_refs",
-                    &span,
-                    Self::cache_args(
-                        path,
-                        [
-                            "for-each-ref",
-                            "--format=%(objectname) %(refname)",
-                            "refs/heads",
-                            "refs/tags",
-                        ],
-                    ),
-                )
-                .await?;
-            Ok(refs::parse_for_each_ref(&String::from_utf8_lossy(&out)))
-        }
-        .instrument(span.clone())
-        .await
+        let argv = Self::cache_args(
+            path,
+            [
+                "for-each-ref",
+                "--format=%(objectname) %(refname)",
+                "refs/heads",
+                "refs/tags",
+            ],
+        );
+        let out = self
+            .run(git_span!("git.local_refs"), "local_refs", None, argv)
+            .await?;
+        Ok(refs::parse_for_each_ref(&String::from_utf8_lossy(&out)))
     }
 
     async fn lfs_fetch(&self, path: &Path, remote: &Remote) -> Result<(), GitError> {
-        let span = tracing::info_span!(
-            "git.lfs_fetch",
-            git.side = remote.side.as_str(),
-            git.exit_code = field::Empty
-        );
-        async {
-            Self::check_remote("lfs_fetch", remote)?;
-            let argv = Self::lfs_args(path, "fetch", remote);
-            self.exec("lfs_fetch", &span, argv).await.map(|_| ())
-        }
-        .instrument(span.clone())
+        let argv = Self::lfs_args(path, "fetch", remote);
+        self.run(
+            git_span!("git.lfs_fetch", remote),
+            "lfs_fetch",
+            Some(remote),
+            argv,
+        )
         .await
+        .map(|_| ())
     }
 
     async fn lfs_push(&self, path: &Path, remote: &Remote) -> Result<(), GitError> {
-        let span = tracing::info_span!(
-            "git.lfs_push",
-            git.side = remote.side.as_str(),
-            git.exit_code = field::Empty
-        );
-        async {
-            Self::check_remote("lfs_push", remote)?;
-            let argv = Self::lfs_args(path, "push", remote);
-            self.exec("lfs_push", &span, argv).await.map(|_| ())
-        }
-        .instrument(span.clone())
+        let argv = Self::lfs_args(path, "push", remote);
+        self.run(
+            git_span!("git.lfs_push", remote),
+            "lfs_push",
+            Some(remote),
+            argv,
+        )
         .await
+        .map(|_| ())
     }
 
     async fn push(&self, path: &Path, remote: &Remote, prune: bool) -> Result<(), GitError> {
-        let span = tracing::info_span!(
-            "git.push",
-            git.side = remote.side.as_str(),
-            git.exit_code = field::Empty
-        );
-        async {
-            Self::check_remote("push", remote)?;
-            let mut argv = Self::cache_args(path, ["push", "--force"]);
-            if prune {
-                argv.push("--prune".into());
-            }
-            argv.push((&remote.url).into());
-            argv.extend(FETCH_REFSPECS.iter().map(OsString::from));
-            self.exec("push", &span, argv).await.map(|_| ())
+        let mut argv = Self::cache_args(path, ["push", "--force"]);
+        if prune {
+            argv.push("--prune".into());
         }
-        .instrument(span.clone())
-        .await
+        argv.push((&remote.url).into());
+        argv.extend(FETCH_REFSPECS.iter().map(OsString::from));
+        self.run(git_span!("git.push", remote), "push", Some(remote), argv)
+            .await
+            .map(|_| ())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn sanitize_redacts_tokens() {
-        let secrets = [Token::new("test-token-not-real")];
-        let text = sanitize_stderr(b"fatal: bad test-token-not-real here", &secrets);
-        assert_eq!(text, "fatal: bad [redacted] here");
-    }
-
-    #[test]
-    fn sanitize_redacts_before_truncating() {
-        let token = "test-token-not-real";
-        // Unredacted, the 4 KiB cut would fall inside the token.
-        let mut raw = "x".repeat(STDERR_LIMIT - 12).into_bytes();
-        raw.extend_from_slice(token.as_bytes());
-        raw.extend_from_slice(b" tail");
-        let text = sanitize_stderr(&raw, &[Token::new(token)]);
-        assert!(text.len() <= STDERR_LIMIT);
-        assert!(!text.contains("test-"), "prefix leaked");
-        assert!(text.contains("[redacted]"));
-    }
-
-    #[test]
-    fn sanitize_truncates_on_char_boundary() {
-        let raw = "é".repeat(STDERR_LIMIT).into_bytes();
-        let text = sanitize_stderr(&raw, &[]);
-        assert!(text.len() <= STDERR_LIMIT);
-        assert!(text.chars().all(|c| c == 'é'));
-    }
-
-    #[test]
-    fn classifies_known_fragments() {
-        let cases = [
-            ("remote: Authentication failed for 'x'", GitErrorKind::Auth),
-            (
-                "fatal: could not read Username for 'https://h': terminal prompts disabled",
-                GitErrorKind::Auth,
-            ),
-            ("remote: Repository not found.", GitErrorKind::NotFound),
-            (
-                "fatal: repository 'https://h/x' not found",
-                GitErrorKind::NotFound,
-            ),
-            (
-                " ! [rejected] main -> main (fetch first)",
-                GitErrorKind::Rejected,
-            ),
-            (
-                " ! [remote rejected] main (hook declined)",
-                GitErrorKind::Rejected,
-            ),
-            ("fatal: Could not resolve host: nope", GitErrorKind::Network),
-            ("curl: Connection refused", GitErrorKind::Network),
-            ("fatal: something odd", GitErrorKind::Other),
-        ];
-        for (stderr, kind) in cases {
-            assert_eq!(classify(stderr), kind, "{stderr}");
-        }
-    }
-
-    #[test]
-    fn display_is_single_summary_plus_stderr() {
-        let error = GitError {
-            kind: GitErrorKind::Rejected,
-            operation: "push",
-            exit_code: Some(1),
-            stderr: "boom\n".into(),
-        };
-        assert_eq!(
-            error.to_string(),
-            "git push failed (rejected, exit code 1): boom"
-        );
-    }
 
     #[test]
     fn side_names() {

@@ -64,7 +64,7 @@ use opentelemetry_sdk::trace::{SdkTracer, SdkTracerProvider, SpanData, SpanProce
 use tracing_opentelemetry::{OpenTelemetryLayer, OpenTelemetrySpanExt};
 use tracing_subscriber::registry::LookupSpan;
 
-use super::Settings;
+use super::ConstTags;
 
 /// Instrumentation scope name of the tracer.
 pub const TRACER_NAME: &str = "ferry";
@@ -140,16 +140,16 @@ impl SpanProcessor for OperationNameProcessor {
 /// product telemetry is off too. The provider is local: it is not installed as
 /// the OpenTelemetry global. It owns its own threads and needs no tokio
 /// runtime, so it can be built and shut down from any thread.
-pub fn build_datadog_provider(settings: &Settings, agent_url: &str) -> SdkTracerProvider {
+pub fn build_datadog_provider(tags: &ConstTags, agent_url: &str) -> SdkTracerProvider {
     let mut builder = Config::builder();
     builder
-        .set_service(settings.service.clone())
-        .set_version(settings.version.clone())
+        .set_service(tags.service.clone())
+        .set_version(tags.version.clone())
         .set_trace_agent_url(agent_url.to_owned())
         .set_trace_sample_rate(1.0)
         .set_remote_config_enabled(false)
         .set_telemetry_enabled(false);
-    if let Some(env) = &settings.env {
+    if let Some(env) = &tags.env {
         builder.set_env(env.clone());
     }
     let config = builder.build();

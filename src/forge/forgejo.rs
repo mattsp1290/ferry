@@ -2,12 +2,13 @@
 //!
 //! There is no method here that removes a repository or a topic.
 
+use reqwest::header::AUTHORIZATION;
 use reqwest::{Method, RequestBuilder, StatusCode};
 use serde::{Deserialize, Deserializer, Serialize};
 use tokio::sync::OnceCell;
 use tracing::field::Empty;
 
-use super::{ForgeError, Raw, auth_header, authorized, build_url, decode, ensure_success, execute};
+use super::{ForgeError, Raw, auth_header, build_url, decode, ensure_success, execute};
 use crate::config::Token;
 
 /// Topic that marks a repository as managed by ferry.
@@ -142,10 +143,10 @@ impl ForgejoClient {
             http.route = route,
             http.status_code = Empty
         );
-        let req = authorized(
-            self.http.request(method, url),
-            auth_header("token", &self.token, route)?,
-        );
+        let req = self
+            .http
+            .request(method, url)
+            .header(AUTHORIZATION, auth_header("token", &self.token, route)?);
         execute(configure(req), route, span).await
     }
 
@@ -205,28 +206,14 @@ impl ForgejoClient {
             auto_init: false,
             description,
         };
-        let raw = if owner.eq_ignore_ascii_case(&login) {
-            self.send(
-                Method::POST,
-                ROUTE_USER_REPOS,
-                &["api", "v1", "user", "repos"],
-                |r| r.json(&body),
-            )
-            .await?
+        let (route, segments) = if owner.eq_ignore_ascii_case(&login) {
+            (ROUTE_USER_REPOS, vec!["api", "v1", "user", "repos"])
         } else {
-            self.send(
-                Method::POST,
-                ROUTE_ORG_REPOS,
-                &["api", "v1", "orgs", owner, "repos"],
-                |r| r.json(&body),
-            )
-            .await?
+            (ROUTE_ORG_REPOS, vec!["api", "v1", "orgs", owner, "repos"])
         };
-        let route = if owner.eq_ignore_ascii_case(&login) {
-            ROUTE_USER_REPOS
-        } else {
-            ROUTE_ORG_REPOS
-        };
+        let raw = self
+            .send(Method::POST, route, &segments, |r| r.json(&body))
+            .await?;
         if raw.status == StatusCode::CONFLICT {
             return match self.get_repo(owner, name).await? {
                 Some(repo) => Ok((repo, CreateOutcome::AlreadyExisted)),
