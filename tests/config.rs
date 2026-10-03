@@ -198,6 +198,10 @@ fn rule_4_numeric_ranges() {
     let cases = [
         ("poll_interval_seconds = 29", "sync.poll_interval_seconds"),
         (
+            "poll_interval_seconds = 86401",
+            "sync.poll_interval_seconds",
+        ),
+        (
             "metadata_interval_seconds = 299",
             "sync.metadata_interval_seconds",
         ),
@@ -212,6 +216,7 @@ fn rule_4_numeric_ranges() {
     }
     for line in [
         "poll_interval_seconds = 30",
+        "poll_interval_seconds = 86400",
         "metadata_interval_seconds = 300",
         "max_concurrency = 1",
         "max_concurrency = 8",

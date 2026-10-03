@@ -2,7 +2,7 @@
 # [forgejo], which is required, and [[repos]], which uses placeholder names.
 
 [sync]
-poll_interval_seconds = 300      # minimum 30
+poll_interval_seconds = 300      # 30..=86400
 metadata_interval_seconds = 3600 # minimum 300
 max_concurrency = 2              # 1..=8
 git_timeout_seconds = 1800       # per git child process

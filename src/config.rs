@@ -20,6 +20,9 @@ pub const FORGEJO_TOKEN_FILE_ENV: &str = "FERRY_FORGEJO_TOKEN_FILE";
 pub const ALLOW_INSECURE_URLS_ENV: &str = "FERRY_ALLOW_INSECURE_URLS";
 
 const MIN_POLL_INTERVAL_SECONDS: u64 = 30;
+/// One day. Unbounded, the value would overflow the scheduler's clock
+/// arithmetic, and a longer interval is not a mirror in any useful sense.
+const MAX_POLL_INTERVAL_SECONDS: u64 = 86_400;
 const MIN_METADATA_INTERVAL_SECONDS: u64 = 300;
 const MAX_CONCURRENCY_RANGE: std::ops::RangeInclusive<usize> = 1..=8;
 
@@ -238,9 +241,11 @@ impl Config {
 
     fn validate_sync(&self, violations: &mut Vec<String>) {
         let sync = &self.sync;
-        if sync.poll_interval_seconds < MIN_POLL_INTERVAL_SECONDS {
+        if !(MIN_POLL_INTERVAL_SECONDS..=MAX_POLL_INTERVAL_SECONDS)
+            .contains(&sync.poll_interval_seconds)
+        {
             violations.push(format!(
-                "sync.poll_interval_seconds is {} but must be at least {MIN_POLL_INTERVAL_SECONDS}",
+                "sync.poll_interval_seconds is {} but must be between {MIN_POLL_INTERVAL_SECONDS} and {MAX_POLL_INTERVAL_SECONDS}",
                 sync.poll_interval_seconds
             ));
         }

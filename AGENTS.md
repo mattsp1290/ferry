@@ -1,9 +1,10 @@
 # Contributor rules
 
 Ferry mirrors an allowlist of GitHub repositories into Forgejo. The design, the
-decisions behind it, and the work-package breakdown live in
-`.agents/plans/github-forgejo-sync-worker/`. Read `00-overview.md` there before
-changing behavior.
+decisions behind it, and the work-package breakdown are in the implementation
+plan. The plan is not part of this repository: it describes the deployment
+environment, so the owner keeps it locally under `.agents/plans/` (ignored by
+git). Ask the owner for it before changing behavior.
 
 ## Quality gate
 
@@ -101,7 +102,9 @@ The cache repository stores no remote and no credential.
 | 5. `cargo zigbuild` for `x86_64-unknown-linux-gnu.2.36` | pass | `scripts/build-binaries.sh` on macOS arm64 |
 | 6. A span arrives in Datadog through the real Agent | **not run** | needs gate G1 (`pup auth login`) and a port-forward to the Agent |
 
-Item 6 must pass before the first cluster rollout.
+The plan requires item 6 to pass before WP6 merges (observability step 0 and
+the execution handoff). It is owner-gated: do not merge this
+work to `main` without it unless Matt decides otherwise.
 
 ## Code conventions
 

@@ -219,10 +219,9 @@ async fn sync_once_exits_2_for_an_invalid_config_or_unknown_repo_filter() {
 #[tokio::test]
 async fn sync_once_exits_1_when_an_entry_fails() {
     let fixture = Fixture::new(200).await;
-    // A port nothing listens on: the GitHub side is unreachable.
-    let closed = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-    let closed_port = closed.local_addr().expect("addr").port();
-    drop(closed);
+    // The discard port: nothing listens there, and unlike a port that was
+    // bound and released, a sibling test cannot take it.
+    let closed_port = 9;
     let config = fixture.config(&format!(
         "[github]\ngit_url = \"http://127.0.0.1:{closed_port}\"\n\n\
          [[repos]]\ngithub = \"owner/alpha\"\nforgejo = \"ferry/alpha\"\nlfs = false\n"

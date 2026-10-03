@@ -26,3 +26,5 @@ rustc-ice-*.txt
 # ferry
 dist/
 /reviews/
+# The implementation plan describes the deployment environment. It stays local.
+/.agents/plans/

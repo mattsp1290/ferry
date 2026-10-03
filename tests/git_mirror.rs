@@ -516,3 +516,106 @@ async fn lfs_objects_move_from_source_to_destination() {
     assert!(!config.contains("url"), "{config}");
     assert!(!config.contains("file://"), "{config}");
 }
+
+/// A `.lfsconfig` committed to the mirrored repository must not choose where
+/// ferry sends LFS objects.
+#[tokio::test]
+async fn lfsconfig_in_the_source_cannot_redirect_the_lfs_push() {
+    if !lfs_enabled() {
+        return;
+    }
+    let fx = Fixture::new();
+    add_lfs_file(&fx);
+    // After the object is stored: point LFS at another endpoint entirely.
+    // Nothing listens there, so any use of it fails the command.
+    std::fs::write(
+        fx.work.join(".lfsconfig"),
+        "[lfs]\n\turl = http://127.0.0.1:9/elsewhere/info/lfs\n",
+    )
+    .unwrap();
+    git(&fx.work, &["add", ".lfsconfig"]);
+    git(&fx.work, &["commit", "-q", "-m", "add .lfsconfig"]);
+    git(
+        &fx.work,
+        &[
+            "-c",
+            "lfs.url=",
+            "push",
+            "-q",
+            "--no-verify",
+            "origin",
+            "main",
+        ],
+    );
+
+    fx.runner.ensure_cache(&fx.cache).await.unwrap();
+    fx.runner.fetch(&fx.cache, &remote(&fx.src)).await.unwrap();
+    fx.runner
+        .lfs_fetch(&fx.cache, &remote(&fx.src))
+        .await
+        .expect("lfs fetch from the source, not from the .lfsconfig endpoint");
+    assert_eq!(lfs_objects(&fx.cache).len(), 1, "cache holds the object");
+
+    let dst = Remote {
+        url: file_url(&fx.dst),
+        side: Side::Forgejo,
+    };
+    fx.runner.lfs_push(&fx.cache, &dst).await.expect("lfs push");
+
+    assert_eq!(
+        lfs_objects(&fx.dst).len(),
+        1,
+        "the destination holds the object"
+    );
+}
+
+/// A probe that never ran says nothing about the cache. Deleting the cache
+/// then would throw away every fetched LFS object at shutdown.
+#[tokio::test]
+async fn cancelled_cache_probe_keeps_the_cache() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cancel = CancellationToken::new();
+    let runner = GitRunner::new(settings(
+        tmp.path(),
+        Duration::from_secs(60),
+        cancel.clone(),
+    ));
+    let cache = tmp.path().join("cache.git");
+    runner.ensure_cache(&cache).await.unwrap();
+    let object = cache.join("lfs-object-stand-in");
+    std::fs::write(&object, "payload").unwrap();
+
+    cancel.cancel();
+    let error = runner.ensure_cache(&cache).await.unwrap_err();
+
+    assert_eq!(error.kind, GitErrorKind::Cancelled, "{error}");
+    assert!(object.exists(), "the cache was deleted");
+}
+
+/// `git` exiting 0 with unreadable output must be an error: for `ls-remote`,
+/// empty output would otherwise read as "the remote has no refs".
+#[tokio::test]
+async fn output_over_the_cap_is_an_error_not_a_truncated_success() {
+    let tmp = tempfile::tempdir().unwrap();
+    // Prints more than the 64 MiB stdout cap, then exits 0.
+    let script = fake_git(
+        tmp.path(),
+        "fake-git-flood",
+        "head -c 70000000 /dev/zero | tr '\\0' 'x'",
+    );
+    let mut s = settings(
+        tmp.path(),
+        Duration::from_secs(120),
+        CancellationToken::new(),
+    );
+    s.git_program = script;
+    let runner = GitRunner::new(s);
+
+    let error = runner
+        .ls_remote(&remote(tmp.path()))
+        .await
+        .expect_err("truncated output must not be a success");
+
+    assert_eq!(error.kind, GitErrorKind::Other, "{error}");
+    assert_eq!(error.exit_code, Some(0));
+}

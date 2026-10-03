@@ -1,7 +1,8 @@
 //! Metrics, logs, and traces for the in-cluster Datadog Agent.
 //!
-//! Telemetry never fails a sync. A bad URL disables that signal with a warning;
-//! a send or export error is counted and logged at most once per minute.
+//! Telemetry never fails a sync. A bad URL disables that signal with a warning.
+//! A DogStatsD send error is counted and logged at most once per minute, and
+//! the Datadog trace exporter's own error lines are limited to one per minute.
 //!
 //! # Lifecycle
 //!
@@ -19,10 +20,11 @@ pub mod metrics;
 pub mod tracing;
 
 use std::io;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::{Duration, Instant};
 
 use ::tracing::Dispatch;
-use tracing_subscriber::filter::LevelFilter;
+use tracing_subscriber::filter::{FilterExt, LevelFilter, dynamic_filter_fn, filter_fn};
 use tracing_subscriber::fmt::MakeWriter;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::{EnvFilter, Layer, Registry};
@@ -132,6 +134,64 @@ pub struct Telemetry;
 
 type Base = Registry;
 
+/// Assembles the subscriber: the log layer behind the level filter, and the
+/// trace layer when a provider exists. `Telemetry::build` uses it, and tests
+/// use it with an in-memory provider so that they exercise the same layering.
+///
+/// The level filter belongs to the log layer alone. As a global filter it
+/// would also drop the spans, and `FERRY_LOG_LEVEL=warn` would then silently
+/// turn tracing off. Within the log layer it applies to events only: spans
+/// always reach the layer, because it takes `repo` and the trace ID of a log
+/// line from the enclosing spans. Otherwise an error line above `info` would
+/// not say which repository failed.
+pub fn compose<L>(
+    log_layer: L,
+    level: EnvFilter,
+    provider: Option<&opentelemetry_sdk::trace::SdkTracerProvider>,
+) -> Dispatch
+where
+    L: Layer<Base> + Send + Sync + 'static,
+{
+    let spans = filter_fn(|meta| meta.is_span() && *meta.level() <= ::tracing::Level::INFO);
+    let log_filter = spans
+        .or(level)
+        // Dynamic: a plain `filter_fn` is evaluated once per callsite and
+        // cached, which would turn the throttle into "always" or "never".
+        .and(dynamic_filter_fn(exporter_throttle(EXPORTER_LOG_INTERVAL)));
+    let otel = provider.map(|provider| tracing::otel_layer(provider).with_filter(TRACE_LEVEL));
+    Dispatch::new(
+        tracing_subscriber::registry()
+            .with(log_layer.with_filter(log_filter))
+            .with(otel),
+    )
+}
+
+/// The Datadog exporter crates log every failed export at `error`. With the
+/// Agent down that is several lines per sync, which would bury real sync
+/// failures in the error stream.
+const EXPORTER_LOG_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Lets one event per `interval` through from the Datadog exporter crates and
+/// everything from other targets.
+fn exporter_throttle<S>(
+    interval: Duration,
+) -> impl Fn(&::tracing::Metadata<'_>, &tracing_subscriber::layer::Context<'_, S>) -> bool {
+    let last = Mutex::new(None::<Instant>);
+    move |meta, _| {
+        let from_exporter = meta.target().starts_with("libdd_")
+            || meta.target().starts_with("datadog_opentelemetry");
+        if !from_exporter || meta.is_span() {
+            return true;
+        }
+        let mut last = last.lock().unwrap_or_else(PoisonError::into_inner);
+        let due = last.is_none_or(|at| at.elapsed() >= interval);
+        if due {
+            *last = Some(Instant::now());
+        }
+        due
+    }
+}
+
 /// Spans and span events at this level and above are exported as traces,
 /// whatever the log level is.
 const TRACE_LEVEL: LevelFilter = LevelFilter::INFO;
@@ -214,16 +274,7 @@ impl Telemetry {
                 .with_ansi(false)
                 .boxed(),
         };
-        // The level filter belongs to the log layer alone. As a global filter
-        // it would also drop the spans, and `FERRY_LOG_LEVEL=warn` would then
-        // silently turn tracing off. Ferry exports every sync as a trace.
-        let otel = provider
-            .as_ref()
-            .map(|provider| tracing::otel_layer(provider).with_filter(TRACE_LEVEL));
-        let subscriber = tracing_subscriber::registry()
-            .with(log_layer.with_filter(filter))
-            .with(otel);
-        let dispatch = Dispatch::new(subscriber);
+        let dispatch = compose(log_layer, filter, provider.as_ref());
 
         ::tracing::dispatcher::with_default(&dispatch, || {
             for warning in &warnings {

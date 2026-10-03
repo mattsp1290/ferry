@@ -165,6 +165,8 @@ struct Failure {
     kind: ErrorKind,
     retry_after: Option<Duration>,
     detail: String,
+    /// Ferry cancelled the pass itself, at shutdown. Not a fault to alert on.
+    cancelled: bool,
 }
 
 impl Failure {
@@ -173,6 +175,16 @@ impl Failure {
             kind,
             retry_after: None,
             detail: detail.to_string(),
+            cancelled: false,
+        }
+    }
+
+    /// A failed git child. `kind` applies unless ferry cancelled the child.
+    fn git(kind: ErrorKind, error: GitError) -> Self {
+        let cancelled = error.kind == GitErrorKind::Cancelled;
+        Self {
+            cancelled,
+            ..Self::new(if cancelled { ErrorKind::Internal } else { kind }, error)
         }
     }
 
@@ -187,7 +199,7 @@ impl Failure {
                 ErrorKind::Internal
             }
         };
-        Self::new(kind, error)
+        Self::git(kind, error)
     }
 
     /// A git failure while reading or writing Forgejo.
@@ -201,7 +213,7 @@ impl Failure {
                 ErrorKind::Internal
             }
         };
-        Self::new(kind, error)
+        Self::git(kind, error)
     }
 
     /// A git failure in the local cache repository.
@@ -210,7 +222,7 @@ impl Failure {
             GitErrorKind::Timeout => ErrorKind::Timeout,
             _ => ErrorKind::Internal,
         };
-        Self::new(kind, error)
+        Self::git(kind, error)
     }
 
     /// A Forgejo REST failure outside metadata reconciliation.
@@ -279,14 +291,18 @@ pub async fn sync_repo(ctx: &SyncContext, entry: &RepoEntry) -> SyncOutcome {
                 outcome
             }
             Err(failure) => {
-                telemetry::tracing::mark_error(&span, failure.kind.as_str());
-                tracing::error!(
-                    result = SyncResult::Error.as_str(),
-                    error_kind = failure.kind.as_str(),
-                    duration_ms,
-                    detail = %failure.detail,
-                    "sync failed"
-                );
+                if failure.cancelled {
+                    tracing::info!(duration_ms, "sync cancelled by shutdown");
+                } else {
+                    telemetry::tracing::mark_error(&span, failure.kind.as_str());
+                    tracing::error!(
+                        result = SyncResult::Error.as_str(),
+                        error_kind = failure.kind.as_str(),
+                        duration_ms,
+                        detail = %failure.detail,
+                        "sync failed"
+                    );
+                }
                 let mut outcome = SyncOutcome::error(failure.kind, duration);
                 outcome.retry_after = failure.retry_after;
                 outcome
@@ -351,12 +367,16 @@ async fn run(ctx: &SyncContext, entry: &RepoEntry) -> Result<Done, Failure> {
             // branches: that is far more likely a fault than an intent.
             Err(Failure::new(
                 ErrorKind::SourceEmpty,
-                "GitHub reports no branches but the Forgejo repository has refs",
+                format!(
+                    "GitHub reports no branches but the Forgejo repository has {} refs",
+                    dst.refs.len()
+                ),
             ))
         };
     }
 
-    let lfs_current = !entry.lfs || marker::is_current(&cache, &src.refs.hash()).await;
+    let lfs_current =
+        !entry.lfs || marker::is_current(&cache, &lfs_marker_value(&src.refs, &dest)).await;
     if src.refs == dst.refs && lfs_current {
         reconcile_metadata(ctx, entry, &dest_repo, src.head.as_deref(), &dst.refs).await?;
         return Ok(Done::unchanged(SyncResult::Noop));
@@ -383,11 +403,11 @@ async fn run(ctx: &SyncContext, entry: &RepoEntry) -> Result<Done, Failure> {
         ctx.git
             .lfs_fetch(&cache, &source)
             .await
-            .map_err(|error| Failure::new(ErrorKind::Lfs, error))?;
+            .map_err(|error| Failure::git(ErrorKind::Lfs, error))?;
         ctx.git
             .lfs_push(&cache, &dest)
             .await
-            .map_err(|error| Failure::new(ErrorKind::Lfs, error))?;
+            .map_err(|error| Failure::git(ErrorKind::Lfs, error))?;
     }
 
     ctx.git
@@ -419,7 +439,7 @@ async fn run(ctx: &SyncContext, entry: &RepoEntry) -> Result<Done, Failure> {
         ));
     }
     if entry.lfs {
-        marker::write(&cache, &local.hash())
+        marker::write(&cache, &lfs_marker_value(&local, &dest))
             .await
             .map_err(|error| {
                 Failure::new(
@@ -434,6 +454,14 @@ async fn run(ctx: &SyncContext, entry: &RepoEntry) -> Result<Done, Failure> {
         refs_changed: count(dst.refs.diff_count(&local)),
         refs_pruned,
     })
+}
+
+/// What the LFS marker records: the mirrored refs and where their LFS
+/// objects were pushed. Including the destination means an entry repointed
+/// at another Forgejo repository with identical refs still pushes its
+/// objects there.
+pub fn lfs_marker_value(refs: &RefMap, dest: &Remote) -> String {
+    format!("{} {}", refs.hash(), dest.url)
 }
 
 fn count(value: usize) -> u32 {
@@ -465,22 +493,42 @@ async fn inspect_existing(
         .has_marker(owner, name)
         .await
         .map_err(Failure::forgejo)?;
+    // Forgejo's own `empty` flag must agree with the ref listing. If the
+    // listing were ever lost, an empty ref map alone would let ferry mark a
+    // populated repository and overwrite it.
+    let untouched = dst.refs.is_empty() && repo.empty;
     if !managed {
-        // Only a marked repository is ferry's to overwrite. An empty one has
-        // nothing to lose, and `adopt` is the owner's explicit consent.
-        if !entry.adopt && !dst.refs.is_empty() {
+        // Only a marked repository is ferry's to overwrite. An untouched one
+        // has nothing to lose, and `adopt` is the owner's explicit consent.
+        if !entry.adopt && !untouched {
             return Err(Failure::new(
                 ErrorKind::DestUnmanaged,
                 format!(
-                    "the Forgejo repository has refs but no {} topic; set adopt = true to take it over",
+                    "the Forgejo repository has content but no {} topic; set adopt = true to take it over",
                     crate::forge::MARKER_TOPIC
                 ),
             ));
+        }
+        if !untouched {
+            // Also what happens when someone removes the topic as a stop
+            // switch while the entry still says adopt = true.
+            tracing::warn!(
+                forgejo_repo = %entry.forgejo,
+                "adopt = true: taking over a populated Forgejo repository that lacks the {} topic",
+                crate::forge::MARKER_TOPIC
+            );
         }
         ctx.forgejo
             .add_marker(owner, name)
             .await
             .map_err(Failure::forgejo)?;
+    }
+    if untouched && repo.has_actions != entry.actions {
+        // Nothing has been pushed yet, so this repository is still being
+        // provisioned: either ferry created it and a later step failed, or
+        // it was created empty for ferry. Without this, a failure between
+        // create and the Actions edit would leave Actions on for good.
+        set_actions(ctx, entry).await?;
     }
     Ok(dst)
 }
@@ -510,7 +558,16 @@ async fn provision(
         .add_marker(owner, name)
         .await
         .map_err(Failure::forgejo)?;
-    // Forgejo would otherwise run the mirrored repository's workflows.
+    set_actions(ctx, entry).await?;
+    tracing::info!(forgejo_repo = %entry.forgejo, "created Forgejo repository");
+
+    Ok((repo, RemoteState::default()))
+}
+
+/// Sets the Actions unit to the entry's `actions` value. Forgejo enables
+/// Actions on new repositories and would run the mirrored workflows.
+async fn set_actions(ctx: &SyncContext, entry: &RepoEntry) -> Result<(), Failure> {
+    let (owner, name) = entry.forgejo_parts();
     let actions = RepoEdit {
         has_actions: Some(entry.actions),
         ..RepoEdit::default()
@@ -518,10 +575,7 @@ async fn provision(
     ctx.forgejo
         .edit_repo(owner, name, &actions)
         .await
-        .map_err(Failure::forgejo)?;
-    tracing::info!(forgejo_repo = %entry.forgejo, "created Forgejo repository");
-
-    Ok((repo, RemoteState::default()))
+        .map_err(Failure::forgejo)
 }
 
 /// The GitHub description, when the REST call is due and succeeds. A failure

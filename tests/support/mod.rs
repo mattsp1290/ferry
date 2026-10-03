@@ -135,6 +135,8 @@ pub struct FakeRepo {
     pub description: String,
     pub has_actions: bool,
     pub topics: Vec<String>,
+    /// What the API reports as `empty`. `None` derives it from the refs.
+    pub reports_empty: Option<bool>,
 }
 
 impl Default for FakeRepo {
@@ -147,6 +149,7 @@ impl Default for FakeRepo {
             // Forgejo enables the Actions unit on new repositories.
             has_actions: true,
             topics: Vec::new(),
+            reports_empty: None,
         }
     }
 }
@@ -171,7 +174,9 @@ impl FakeRepo {
             "description": self.description,
             "has_actions": self.has_actions,
             "topics": self.topics,
-            "empty": ref_map(git_dir).is_empty(),
+            "empty": self
+                .reports_empty
+                .unwrap_or_else(|| ref_map(git_dir).is_empty()),
         })
     }
 }
@@ -484,7 +489,28 @@ pub struct LoggingGit {
     /// Makes `fetch` hang until the runner is cancelled, like a git child
     /// that only stops when shutdown kills its process group.
     pub hang_fetch: AtomicBool,
+    /// Runs once, just before the next real fetch.
+    pub before_fetch: Hook,
+    /// Runs once, right after the next successful ref push.
+    pub after_push: Hook,
     cancel: CancellationToken,
+}
+
+/// A one-shot callback a test arms to change the world mid-sync.
+#[derive(Default)]
+pub struct Hook(Mutex<Option<Box<dyn FnOnce() + Send>>>);
+
+impl Hook {
+    pub fn arm(&self, action: impl FnOnce() + Send + 'static) {
+        *lock(&self.0) = Some(Box::new(action));
+    }
+
+    fn fire(&self) {
+        let action = lock(&self.0).take();
+        if let Some(action) = action {
+            action();
+        }
+    }
 }
 
 impl LoggingGit {
@@ -522,6 +548,7 @@ impl Git for LoggingGit {
                 stderr: String::new(),
             });
         }
+        self.before_fetch.fire();
         self.inner.fetch(path, remote).await
     }
 
@@ -555,7 +582,9 @@ impl Git for LoggingGit {
         } else {
             "git:push"
         });
-        self.inner.push(path, remote, prune).await
+        self.inner.push(path, remote, prune).await?;
+        self.after_push.fire();
+        Ok(())
     }
 }
 
@@ -585,6 +614,8 @@ fn logging_git(
         stub_lfs: AtomicBool::new(!lfs_enabled),
         fail_lfs_push: AtomicBool::new(false),
         hang_fetch: AtomicBool::new(false),
+        before_fetch: Hook::default(),
+        after_push: Hook::default(),
         cancel: cancel.clone(),
     })
 }
@@ -813,6 +844,18 @@ impl World {
 
     pub fn syncer(&self) -> Arc<RepoSyncer> {
         Arc::new(RepoSyncer::new(self.context()))
+    }
+
+    /// The value ferry records in the LFS marker of `entry` for `refs`.
+    pub fn lfs_marker_value(&self, entry: &RepoEntry, refs: &RefMap) -> String {
+        let dest = Remote {
+            url: format!(
+                "{}.git",
+                file_url(&self.dest_git_dir(entry)).trim_end_matches(".git")
+            ),
+            side: ferry::git::Side::Forgejo,
+        };
+        ferry::sync::lfs_marker_value(refs, &dest)
     }
 
     /// The cache repository ferry uses for `entry`.

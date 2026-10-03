@@ -1,7 +1,7 @@
 //! End-to-end sync tests: real git over `file://` remotes, fake REST APIs.
 //!
-//! The numbered cases follow the WP5 test list in
-//! `.agents/plans/github-forgejo-sync-worker/03-sync-engine.md`.
+//! The numbered cases follow the test list of the sync-engine work package
+//! in the implementation plan.
 
 mod support;
 
@@ -436,7 +436,7 @@ async fn case_15_missing_lfs_marker_runs_the_lfs_steps_once() {
     assert_eq!(world.events.count("git:lfs_push"), 1);
     assert_eq!(
         std::fs::read_to_string(&marker).expect("marker").trim(),
-        source.refs().hash()
+        world.lfs_marker_value(&entry, &source.refs())
     );
 
     world.events.clear();
@@ -544,13 +544,17 @@ async fn case_18_one_failing_entry_does_not_stop_the_next() {
     let source = world.source(&present);
     let metrics = RecordingMetrics::new();
 
-    let outcomes = run_once(
+    let outcomes: Vec<SyncOutcome> = run_once(
         world.syncer(),
         &metrics,
         &[missing.clone(), present.clone()],
         1,
+        &CancellationToken::new(),
     )
-    .await;
+    .await
+    .into_iter()
+    .map(|outcome| outcome.expect("every entry ran"))
+    .collect();
 
     assert_error(&outcomes[0], ErrorKind::SourceMissing);
     assert_synced(&outcomes[1]);
@@ -637,17 +641,17 @@ async fn case_19_failing_entry_is_not_retried_before_its_backoff() {
     let seconds =
         |calls: Vec<Duration>| -> Vec<u64> { calls.iter().map(Duration::as_secs).collect() };
 
-    // Tick 0 runs the readiness check, tick 1 starts the first sync.
-    tokio::time::sleep(Duration::from_secs(305)).await;
-    assert_eq!(seconds(syncer.calls()), [10]);
+    // The first sync starts as soon as the readiness check passes.
+    tokio::time::sleep(Duration::from_secs(295)).await;
+    assert_eq!(seconds(syncer.calls()), [0]);
     // First failure: retry after one poll interval.
     tokio::time::sleep(Duration::from_secs(10)).await;
-    assert_eq!(seconds(syncer.calls()), [10, 310]);
+    assert_eq!(seconds(syncer.calls()), [0, 300]);
     // Second failure: the backoff doubles to 600 s.
     tokio::time::sleep(Duration::from_secs(590)).await;
-    assert_eq!(seconds(syncer.calls()), [10, 310]);
+    assert_eq!(seconds(syncer.calls()), [0, 300]);
     tokio::time::sleep(Duration::from_secs(10)).await;
-    assert_eq!(seconds(syncer.calls()), [10, 310, 910]);
+    assert_eq!(seconds(syncer.calls()), [0, 300, 900]);
     assert_eq!(shared.snapshot()[0].consecutive_failures, 3);
     assert_eq!(shared.snapshot()[0].last_success, None);
 
@@ -673,10 +677,10 @@ async fn case_19b_success_resets_the_backoff_and_polls_on_the_interval() {
     .with_jitter(|| 0.0);
     let task = tokio::spawn(scheduler.run(shutdown.clone(), CancellationToken::new()));
 
-    tokio::time::sleep(Duration::from_secs(1525)).await;
+    tokio::time::sleep(Duration::from_secs(1505)).await;
     let calls: Vec<u64> = syncer.calls().iter().map(Duration::as_secs).collect();
-    // Fail at 10 and 310, succeed at 910, then every 300 s.
-    assert_eq!(calls, [10, 310, 910, 1210, 1510]);
+    // Fail at 0 and 300, succeed at 900, then every 300 s.
+    assert_eq!(calls, [0, 300, 900, 1200, 1500]);
     let status = shared.snapshot()[0];
     assert_eq!(status.consecutive_failures, 0);
     assert!(status.last_success.is_some());
@@ -868,4 +872,294 @@ async fn no_sync_starts_before_forgejo_accepts_the_token() {
     shutdown.cancel();
     task.await.expect("scheduler exits");
     assert_no_delete(&world).await;
+}
+
+#[tokio::test]
+async fn case_22_destination_changed_after_the_push_is_a_verify_mismatch() {
+    let world = World::new().await;
+    let mut entry = World::entry("alpha");
+    entry.lfs = true;
+    let source = world.source(&entry);
+    world.git.stub_lfs.store(true, Ordering::SeqCst);
+    let ctx = world.context();
+    assert_synced(&sync_repo(&ctx, &entry).await);
+    let marker = world.cache_path(&entry).join(MARKER_FILE);
+    let old_marker = std::fs::read_to_string(&marker).expect("marker");
+    let old_tip = source
+        .refs()
+        .get("refs/heads/main")
+        .expect("main")
+        .to_string();
+
+    // Someone moves the branch back on Forgejo right after ferry's push.
+    source.commit("README.md", "second\n");
+    let dest = world.dest_git_dir(&entry);
+    world.git.after_push.arm(move || {
+        support::git(&dest, &["update-ref", "refs/heads/main", &old_tip]);
+    });
+    let outcome = sync_repo(&ctx, &entry).await;
+
+    assert_error(&outcome, ErrorKind::VerifyMismatch);
+    // An unverified sync must not record its LFS objects as complete.
+    assert_eq!(
+        std::fs::read_to_string(&marker).expect("marker"),
+        old_marker
+    );
+
+    assert_synced(&sync_repo(&ctx, &entry).await);
+    assert_eq!(world.dest_refs(&entry), source.refs());
+    assert_no_delete(&world).await;
+}
+
+#[tokio::test]
+async fn case_08c_source_that_loses_its_branches_before_the_fetch_is_not_pruned() {
+    let world = World::new().await;
+    let entry = World::entry("alpha");
+    let source = world.source(&entry);
+    source.branch("feature");
+    let ctx = world.context();
+    assert_synced(&sync_repo(&ctx, &entry).await);
+    let before = world.dest_refs(&entry);
+
+    // The first ls-remote still sees branches; the fetch does not.
+    source.commit("README.md", "second\n");
+    let bare = source.bare.clone();
+    world.git.before_fetch.arm(move || {
+        let heads = support::git(
+            &bare,
+            &["for-each-ref", "--format=%(refname)", "refs/heads"],
+        );
+        for head in heads.lines() {
+            support::git(&bare, &["update-ref", "-d", head]);
+        }
+    });
+    world.events.clear();
+    let outcome = sync_repo(&ctx, &entry).await;
+
+    assert_error(&outcome, ErrorKind::SourceEmpty);
+    assert_eq!(world.events.count("git:fetch"), 1);
+    assert_eq!(git_writes(&world), 0);
+    assert_eq!(world.dest_refs(&entry), before);
+    assert_no_delete(&world).await;
+}
+
+#[tokio::test]
+async fn case_23_failed_provisioning_still_ends_with_actions_disabled() {
+    let world = World::new().await;
+    let entry = World::entry("alpha");
+    let source = world.source(&entry);
+    let ctx = world.context();
+
+    // The repository is created, then the Actions edit fails.
+    world.state().edit_status = Some(500);
+    let outcome = sync_repo(&ctx, &entry).await;
+    assert_eq!(outcome.result, SyncResult::Error, "{outcome:?}");
+    let dest = world.dest(&entry).expect("created");
+    assert!(
+        dest.has_actions,
+        "the fake creates repositories with Actions on"
+    );
+    assert_eq!(git_writes(&world), 0);
+
+    // The next pass finds an existing repository and must finish the job.
+    world.state().edit_status = None;
+    assert_synced(&sync_repo(&ctx, &entry).await);
+    let dest = world.dest(&entry).expect("dest");
+    assert!(!dest.has_actions);
+    assert!(dest.has_marker());
+    assert_eq!(world.dest_refs(&entry), source.refs());
+    assert_no_delete(&world).await;
+}
+
+#[tokio::test]
+async fn case_24_unmarked_destination_forgejo_calls_non_empty_is_refused() {
+    let world = World::new().await;
+    let entry = World::entry("alpha");
+    world.source(&entry);
+    // No refs are listed, yet Forgejo says the repository has content. The
+    // ref listing alone must not be enough to take a repository over.
+    world.existing_dest(
+        &entry,
+        FakeRepo {
+            reports_empty: Some(false),
+            ..FakeRepo::default()
+        },
+    );
+    let ctx = world.context();
+
+    let outcome = sync_repo(&ctx, &entry).await;
+
+    assert_error(&outcome, ErrorKind::DestUnmanaged);
+    assert_eq!(world.events.count("forgejo:PUT"), 0);
+    assert_eq!(git_writes(&world), 0);
+    assert_no_delete(&world).await;
+}
+
+// --- scheduler behaviour with scripted syncers ---------------------------------
+
+/// Records the order entries start in and how many run at once.
+struct ProbeSyncer {
+    started: Instant,
+    duration: Duration,
+    running: std::sync::atomic::AtomicUsize,
+    peak: std::sync::atomic::AtomicUsize,
+    starts: Mutex<Vec<(String, u64)>>,
+    panic_on: Option<String>,
+}
+
+impl ProbeSyncer {
+    fn new(duration: Duration, panic_on: Option<&str>) -> Arc<Self> {
+        Arc::new(Self {
+            started: Instant::now(),
+            duration,
+            running: std::sync::atomic::AtomicUsize::new(0),
+            peak: std::sync::atomic::AtomicUsize::new(0),
+            starts: Mutex::new(Vec::new()),
+            panic_on: panic_on.map(str::to_string),
+        })
+    }
+
+    fn starts(&self) -> Vec<(String, u64)> {
+        self.starts.lock().expect("starts").clone()
+    }
+}
+
+#[async_trait]
+impl Syncer for ProbeSyncer {
+    async fn check_ready(&self) -> Result<(), String> {
+        Ok(())
+    }
+
+    async fn sync(&self, entry: &RepoEntry) -> SyncOutcome {
+        self.starts
+            .lock()
+            .expect("starts")
+            .push((entry.github.clone(), self.started.elapsed().as_secs()));
+        assert!(
+            self.panic_on.as_deref() != Some(entry.github.as_str()),
+            "scripted panic"
+        );
+        let running = self.running.fetch_add(1, Ordering::SeqCst) + 1;
+        self.peak.fetch_max(running, Ordering::SeqCst);
+        tokio::time::sleep(self.duration).await;
+        self.running.fetch_sub(1, Ordering::SeqCst);
+        SyncOutcome::success(SyncResult::Noop, self.duration)
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn concurrency_is_capped_and_the_longest_waiting_entry_goes_first() {
+    // 8 entries, 100 s each, 2 at a time: one round takes 400 s, longer than
+    // the 300 s poll interval. In plain config order the first entries would
+    // become due again and the last ones would never run.
+    let entries: Vec<RepoEntry> = (0..8).map(|n| World::entry(&format!("r{n}"))).collect();
+    let syncer = ProbeSyncer::new(Duration::from_secs(100), None);
+    let shutdown = CancellationToken::new();
+    let scheduler = Scheduler::new(
+        Arc::clone(&syncer) as Arc<dyn Syncer>,
+        Arc::new(NoopMetrics),
+        HealthState::new(),
+        scheduler_config(Duration::from_secs(300), Duration::from_secs(10)),
+        SharedStatus::new(&entries),
+    );
+    let task = tokio::spawn(scheduler.run(shutdown.clone(), CancellationToken::new()));
+
+    tokio::time::sleep(Duration::from_secs(795)).await;
+    shutdown.cancel();
+    task.await.expect("scheduler exits");
+
+    assert_eq!(syncer.peak.load(Ordering::SeqCst), 2);
+    let starts = syncer.starts();
+    // A freed slot is refilled at once, not at the next tick.
+    let first_round: Vec<u64> = starts.iter().take(8).map(|(_, at)| *at).collect();
+    assert_eq!(first_round, [0, 0, 100, 100, 200, 200, 300, 300]);
+    // Every entry ran in each of the first two rounds, in config order.
+    for round in starts.chunks(8).take(2) {
+        let names: Vec<&str> = round.iter().map(|(name, _)| name.as_str()).collect();
+        let expected: Vec<String> = (0..8).map(|n| format!("owner/r{n}")).collect();
+        assert_eq!(names, expected);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_panicking_sync_is_an_internal_error_for_that_entry_only() {
+    let entries = [World::entry("bad"), World::entry("good")];
+    let syncer = ProbeSyncer::new(Duration::from_secs(1), Some("owner/bad"));
+    let metrics = Arc::new(RecordingMetrics::new());
+    let shared = SharedStatus::new(&entries);
+    let shutdown = CancellationToken::new();
+    let scheduler = Scheduler::new(
+        Arc::clone(&syncer) as Arc<dyn Syncer>,
+        Arc::clone(&metrics) as Arc<dyn ferry::telemetry::Metrics>,
+        HealthState::new(),
+        scheduler_config(Duration::from_secs(300), Duration::from_secs(10)),
+        shared.clone(),
+    )
+    .with_jitter(|| 0.0);
+    let task = tokio::spawn(scheduler.run(shutdown.clone(), CancellationToken::new()));
+
+    tokio::time::sleep(Duration::from_secs(305)).await;
+    shutdown.cancel();
+    task.await.expect("the scheduler survives a panicking sync");
+
+    let bad = metrics.outcomes_for("owner/bad");
+    assert_eq!(bad.len(), 2, "the entry is retried after its backoff");
+    assert_error(&bad[0], ErrorKind::Internal);
+    let good = metrics.outcomes_for("owner/good");
+    assert_eq!(good.len(), 2);
+    assert_eq!(good[0].result, SyncResult::Noop);
+    assert_eq!(shared.snapshot()[0].consecutive_failures, 2);
+    assert_eq!(shared.snapshot()[1].consecutive_failures, 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_rate_limited_entry_waits_for_the_forge_but_not_forever() {
+    let mut limited = SyncOutcome::error(ErrorKind::RateLimited, Duration::ZERO);
+    limited.retry_after = Some(Duration::from_secs(1000));
+    let mut hostile = SyncOutcome::error(ErrorKind::RateLimited, Duration::ZERO);
+    hostile.retry_after = Some(Duration::MAX);
+    let success = SyncOutcome::success(SyncResult::Noop, Duration::ZERO);
+    let syncer = ScriptedSyncer::new(vec![limited, hostile], success);
+    let entries = [World::entry("alpha")];
+    let shutdown = CancellationToken::new();
+    let scheduler = Scheduler::new(
+        Arc::clone(&syncer) as Arc<dyn Syncer>,
+        Arc::new(NoopMetrics),
+        HealthState::new(),
+        scheduler_config(Duration::from_secs(300), Duration::from_secs(10)),
+        SharedStatus::new(&entries),
+    )
+    .with_jitter(|| 0.0);
+    let task = tokio::spawn(scheduler.run(shutdown.clone(), CancellationToken::new()));
+
+    // Retry-After of 1000 s beats the 300 s backoff. An absurd value is
+    // clamped to six hours instead of panicking or parking the entry.
+    tokio::time::sleep(Duration::from_secs(1000 + 6 * 3600 + 5)).await;
+    let calls: Vec<u64> = syncer.calls().iter().map(Duration::as_secs).collect();
+    assert_eq!(calls[..3], [0, 1000, 1000 + 6 * 3600]);
+
+    shutdown.cancel();
+    task.await.expect("scheduler exits");
+}
+
+#[tokio::test]
+async fn run_once_starts_nothing_after_cancellation() {
+    let entries = [World::entry("alpha"), World::entry("beta")];
+    let syncer = ProbeSyncer::new(Duration::from_millis(1), None);
+    let metrics = RecordingMetrics::new();
+    let cancel = CancellationToken::new();
+    cancel.cancel();
+
+    let outcomes = run_once(
+        Arc::clone(&syncer) as Arc<dyn Syncer>,
+        &metrics,
+        &entries,
+        2,
+        &cancel,
+    )
+    .await;
+
+    assert_eq!(outcomes, [None, None]);
+    assert!(syncer.starts().is_empty());
+    assert!(metrics.events().is_empty());
 }

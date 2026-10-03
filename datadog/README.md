@@ -44,6 +44,14 @@ pup --no-agent monitors create --file datadog/monitors/heartbeat-missing.json
 pup --no-agent dashboards create --file datadog/dashboard.json
 ```
 
+### Enable percentiles for `ferry.sync.duration`
+
+`ferry.sync.duration` is a distribution. Datadog computes `p50` and `p95` for
+a distribution only after percentile aggregation is enabled for that metric,
+and the "Sync duration" widget stays empty until then. Once the metric has
+reported at least once: Metrics → Summary → `ferry.sync.duration` →
+Advanced → enable percentiles. This is a one-time step per org.
+
 ## Update and diff
 
 ```sh
@@ -76,7 +84,7 @@ Fill in after the first apply.
 | Monitor | Query | Critical | Warning | `notify_no_data` |
 |---|---|---|---|---|
 | Repo stale | `min(last_10m):min:ferry.repo.last_success_age_seconds{service:ferry} by {repo} > 3600` | 3600 | 1800 | `false` |
-| Sync failing | `min(last_10m):min:ferry.repo.consecutive_failures{service:ferry} by {repo} >= 3` | 3 | none | default |
+| Sync failing | `min(last_10m):min:ferry.repo.consecutive_failures{service:ferry} by {repo} >= 3` | 3 | none | `false` |
 | Heartbeat missing | `sum(last_10m):sum:ferry.heartbeat{service:ferry} < 1` | 1 | none | `true` (`no_data_timeframe: 10`) |
 
 Rule: stale critical = `12 x poll_interval`. The values above assume the
@@ -110,6 +118,14 @@ For one allowlist entry that always fails, with default settings:
   delay a stale alert but cannot suppress it.
 - Recovery: after the fault is removed, the next attempt can be up to 60
   minutes away (backoff cap). A pod restart retries immediately.
+
+### One ferry per org
+
+The heartbeat query is scoped by `service:ferry` only. A second ferry that
+reports to the same Datadog org (another cluster, or a local run with
+`DD_DOGSTATSD_URL` set) would keep the sum above zero and hide a dead worker.
+The design runs exactly one replica. If that changes, add the `env` tag to the
+scope of all three monitors.
 
 ## Removed allowlist entries
 

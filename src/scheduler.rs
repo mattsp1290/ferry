@@ -22,6 +22,9 @@ use crate::telemetry::Metrics;
 
 /// Upper bound of the failure backoff.
 pub const MAX_BACKOFF: Duration = Duration::from_secs(3600);
+/// Longest wait a forge may impose through `Retry-After`. The header is
+/// remote input: unbounded, it could park an entry for years.
+pub const MAX_RETRY_AFTER: Duration = Duration::from_secs(6 * 3600);
 /// Fraction by which a backoff delay is randomly shortened or lengthened.
 const JITTER_FRACTION: f64 = 0.10;
 const READY_RETRY_INITIAL: Duration = Duration::from_secs(5);
@@ -202,7 +205,11 @@ impl Scheduler {
                     self.start_ready_check();
                     self.start_due();
                 }
-                Some(joined) = self.tasks.join_next_with_id() => self.finish(joined),
+                Some(joined) = self.tasks.join_next_with_id() => {
+                    self.finish(joined);
+                    // Refill the freed slot now instead of at the next tick.
+                    self.start_due();
+                }
             }
         }
 
@@ -219,22 +226,29 @@ impl Scheduler {
         self.ready_check_in_flight = true;
     }
 
-    /// Starts due entries in config order, up to the concurrency limit.
-    /// No sync starts before the first successful readiness check.
+    /// Starts due entries up to the concurrency limit, the longest-waiting
+    /// first. Config order breaks ties. Serving entries in plain config order
+    /// would starve the tail of an allowlist that is too large for one poll
+    /// interval. No sync starts before the first successful readiness check.
     fn start_due(&mut self) {
         if !self.ready {
             return;
         }
         let now = Instant::now();
-        for index in 0..self.states.len() {
-            if self.running.len() >= self.config.max_concurrency {
-                break;
-            }
-            let state = &mut self.states[index];
-            if state.in_flight || now < state.next_attempt {
-                continue;
-            }
-            state.in_flight = true;
+        let free = self
+            .config
+            .max_concurrency
+            .saturating_sub(self.running.len());
+        let mut due: Vec<usize> = (0..self.states.len())
+            .filter(|&index| {
+                let state = &self.states[index];
+                !state.in_flight && now >= state.next_attempt
+            })
+            .collect();
+        due.sort_by_key(|&index| self.states[index].next_attempt);
+
+        for index in due.into_iter().take(free) {
+            self.states[index].in_flight = true;
             let syncer = Arc::clone(&self.syncer);
             let entry = self.shared.entries()[index].clone();
             let handle = self
@@ -287,7 +301,7 @@ impl Scheduler {
             Err(reason) => {
                 self.ready_failures = self.ready_failures.saturating_add(1);
                 let delay = exponential(READY_RETRY_INITIAL, self.ready_failures, READY_RETRY_MAX);
-                self.next_ready_attempt = Instant::now() + delay;
+                self.next_ready_attempt = later(Instant::now(), delay);
                 tracing::warn!(
                     reason,
                     retry_in_seconds = delay.as_secs(),
@@ -311,7 +325,7 @@ impl Scheduler {
                 last_success: Some(now),
                 consecutive_failures: 0,
             };
-            state.next_attempt = started + poll_interval;
+            state.next_attempt = later(started, poll_interval);
         } else {
             state.status.consecutive_failures = state.status.consecutive_failures.saturating_add(1);
             let delay = failure_delay(
@@ -320,7 +334,7 @@ impl Scheduler {
                 outcome.retry_after,
                 (self.jitter)(),
             );
-            state.next_attempt = now + delay;
+            state.next_attempt = later(now, delay);
         }
         self.shared.update(index, state.status);
     }
@@ -328,7 +342,9 @@ impl Scheduler {
     /// Shutdown: start nothing new, give in-flight syncs `shutdown_grace`,
     /// then cancel them and give their git children `cancel_grace` to die.
     async fn drain(mut self, ticker: &mut tokio::time::Interval, cancel_syncs: CancellationToken) {
-        if self.tasks.is_empty() {
+        if self.running.is_empty() {
+            // At most a readiness check is in flight. Nothing waits for it.
+            self.tasks.shutdown().await;
             return;
         }
         tracing::info!(
@@ -365,6 +381,13 @@ impl Scheduler {
     }
 }
 
+/// `from + delay`. `Instant` addition panics on overflow, and a panic here
+/// would take the whole scheduler down, so an unrepresentable instant falls
+/// back to the longest backoff.
+fn later(from: Instant, delay: Duration) -> Instant {
+    from.checked_add(delay).unwrap_or(from + MAX_BACKOFF)
+}
+
 /// `base × 2^(failures − 1)`, capped at `max`.
 fn exponential(base: Duration, failures: u32, max: Duration) -> Duration {
     let doublings = failures.saturating_sub(1).min(31);
@@ -373,7 +396,7 @@ fn exponential(base: Duration, failures: u32, max: Duration) -> Duration {
 
 /// Delay before the next attempt after a failure: exponential backoff from
 /// the poll interval, capped at `MAX_BACKOFF`, with ±10 % jitter. A forge
-/// that named a longer wait (`retry_after`) wins.
+/// that named a longer wait (`retry_after`) wins, up to `MAX_RETRY_AFTER`.
 ///
 /// `jitter` is in `-1.0..=1.0`.
 pub fn failure_delay(
@@ -388,24 +411,31 @@ pub fn failure_delay(
     let backoff = exponential(poll_interval, consecutive_failures, cap);
     let factor = 1.0 + JITTER_FRACTION * jitter.clamp(-1.0, 1.0);
     let jittered = backoff.mul_f64(factor);
-    retry_after.map_or(jittered, |retry_after| jittered.max(retry_after))
+    retry_after.map_or(jittered, |retry_after| {
+        jittered.max(retry_after.min(MAX_RETRY_AFTER))
+    })
 }
 
 /// Runs every entry once with bounded concurrency and no backoff. Results
 /// come back in allowlist order.
+///
+/// Once `cancel` is cancelled no further entry starts. An entry that never
+/// started has no outcome (`None`) and emits no metric.
 pub async fn run_once(
     syncer: Arc<dyn Syncer>,
     metrics: &dyn Metrics,
     entries: &[RepoEntry],
     max_concurrency: usize,
-) -> Vec<SyncOutcome> {
+    cancel: &CancellationToken,
+) -> Vec<Option<SyncOutcome>> {
     let mut outcomes: Vec<Option<SyncOutcome>> = vec![None; entries.len()];
     let mut tasks: JoinSet<SyncOutcome> = JoinSet::new();
     let mut running: HashMap<Id, Running> = HashMap::new();
     let mut next = 0;
 
     loop {
-        while next < entries.len() && tasks.len() < max_concurrency.max(1) {
+        while next < entries.len() && tasks.len() < max_concurrency.max(1) && !cancel.is_cancelled()
+        {
             let syncer = Arc::clone(&syncer);
             let entry = entries[next].clone();
             let handle = tasks.spawn(async move { syncer.sync(&entry).await });
@@ -437,11 +467,6 @@ pub async fn run_once(
     }
 
     outcomes
-        .into_iter()
-        .map(|outcome| {
-            outcome.unwrap_or_else(|| SyncOutcome::error(ErrorKind::Internal, Duration::ZERO))
-        })
-        .collect()
 }
 
 /// Settings of the periodic metrics emitter.
@@ -585,6 +610,16 @@ mod tests {
         let short = Some(Duration::from_secs(10));
         assert_eq!(failure_delay(POLL, 1, long, 0.0), Duration::from_secs(900));
         assert_eq!(failure_delay(POLL, 1, short, 0.0), Duration::from_secs(300));
+    }
+
+    #[test]
+    fn failure_delay_bounds_a_hostile_retry_after() {
+        let delay = failure_delay(POLL, 1, Some(Duration::MAX), 0.0);
+        assert_eq!(delay, MAX_RETRY_AFTER);
+        // And the instant arithmetic on top of it cannot panic.
+        let now = Instant::now();
+        assert!(later(now, delay) > now);
+        assert_eq!(later(now, Duration::MAX), now + MAX_BACKOFF);
     }
 
     #[test]

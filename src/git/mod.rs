@@ -340,6 +340,39 @@ impl GitRunner {
         out
     }
 
+    /// The LFS endpoint that belongs to `remote`.
+    fn lfs_endpoint(remote: &Remote) -> String {
+        if remote.url.starts_with("http://") || remote.url.starts_with("https://") {
+            format!("{}/info/lfs", remote.url.trim_end_matches('/'))
+        } else {
+            // `file://` remotes, which tests use: the repository itself.
+            remote.url.clone()
+        }
+    }
+
+    /// `git lfs <verb> --all <remote>` with the LFS endpoint pinned.
+    ///
+    /// git-lfs reads `.lfsconfig` from the cache's `HEAD`, and an `lfs.url`
+    /// there outranks the remote argument. Left alone, the content of a
+    /// mirrored repository could send ferry's token-authenticated upload to
+    /// another repository or host, and the push to Forgejo would "succeed"
+    /// having uploaded nothing. Command-line config outranks `.lfsconfig`.
+    ///
+    /// git-lfs accepts a URL in the remote position, so the cache repository
+    /// stores no remote.
+    fn lfs_args(path: &Path, verb: &str, remote: &Remote) -> Vec<OsString> {
+        let endpoint = Self::lfs_endpoint(remote);
+        let mut argv: Vec<OsString> = vec![
+            "-c".into(),
+            format!("lfs.url={endpoint}").into(),
+            "-c".into(),
+            format!("lfs.pushurl={endpoint}").into(),
+        ];
+        argv.extend(Self::cache_args(path, ["lfs", verb, "--all"]));
+        argv.push((&remote.url).into());
+        argv
+    }
+
     fn child_env(&self) -> Vec<(&'static str, OsString)> {
         let s = &self.settings;
         let mut env: Vec<(&'static str, OsString)> = vec![
@@ -453,7 +486,7 @@ impl GitRunner {
         if let Some(code) = exit_code {
             span.record("git.exit_code", i64::from(code));
         }
-        let stderr_text = sanitize_stderr(&err, &s.secrets);
+        let stderr_text = sanitize_stderr(&err.bytes, &s.secrets);
         if let Some(kind) = kind {
             return Err(GitError {
                 kind,
@@ -463,7 +496,15 @@ impl GitRunner {
             });
         }
         match status {
-            Some(status) if status.success() => Ok(out),
+            Some(status) if status.success() && out.complete => Ok(out.bytes),
+            // Fail closed. Returning partial or empty output as success
+            // would, for `ls-remote`, read as "the remote has no refs".
+            Some(status) if status.success() => Err(GitError {
+                kind: GitErrorKind::Other,
+                operation,
+                exit_code,
+                stderr: "git exited 0 but its output could not be read in full".to_string(),
+            }),
             _ => Err(GitError {
                 kind: classify(&stderr_text),
                 operation,
@@ -478,32 +519,50 @@ fn args<const N: usize>(items: [&str; N]) -> Vec<OsString> {
     items.iter().map(OsString::from).collect()
 }
 
+/// What a reader task collected from one pipe.
+struct Captured {
+    bytes: Vec<u8>,
+    /// False when a read failed or the output exceeded the cap.
+    complete: bool,
+}
+
 /// Reads up to `cap` bytes and drains the rest so the child never blocks.
-async fn read_capped<R: AsyncRead + Unpin>(mut pipe: R, cap: usize) -> Vec<u8> {
-    let mut buf = Vec::new();
+async fn read_capped<R: AsyncRead + Unpin>(mut pipe: R, cap: usize) -> Captured {
+    let mut bytes = Vec::new();
     let mut chunk = [0u8; 8192];
+    let mut complete = true;
     loop {
         match pipe.read(&mut chunk).await {
-            Ok(0) | Err(_) => break,
+            Ok(0) => break,
+            Err(_) => {
+                complete = false;
+                break;
+            }
             Ok(n) => {
-                let room = cap.saturating_sub(buf.len());
-                buf.extend_from_slice(&chunk[..n.min(room)]);
+                let room = cap.saturating_sub(bytes.len());
+                complete &= n <= room;
+                bytes.extend_from_slice(&chunk[..n.min(room)]);
             }
         }
     }
-    buf
+    Captured { bytes, complete }
 }
 
 /// Collects a reader task, giving up if a detached grandchild holds the pipe.
-async fn join_pipe(task: Option<tokio::task::JoinHandle<Vec<u8>>>) -> Vec<u8> {
+/// Whatever was not read in full is reported as incomplete.
+async fn join_pipe(task: Option<tokio::task::JoinHandle<Captured>>) -> Captured {
+    let incomplete = Captured {
+        bytes: Vec::new(),
+        complete: false,
+    };
     let Some(mut task) = task else {
-        return Vec::new();
+        return incomplete;
     };
     match tokio::time::timeout(PIPE_DRAIN_WAIT, &mut task).await {
-        Ok(Ok(bytes)) => bytes,
+        Ok(Ok(captured)) => captured,
         _ => {
             task.abort();
-            Vec::new()
+            incomplete
         }
     }
 }
@@ -554,8 +613,14 @@ impl Git for GitRunner {
                 self.exec("init", &span, init)
             };
             if tokio::fs::try_exists(path).await.unwrap_or(false) {
-                if probe().await.is_ok() {
-                    return Ok(());
+                match probe().await {
+                    Ok(_) => return Ok(()),
+                    // git ran and rejected the directory: a corrupt cache.
+                    Err(error) if error.exit_code.is_some() => {}
+                    // Cancelled, timed out, or never started. That says
+                    // nothing about the cache, and deleting it would cost a
+                    // full re-fetch and LFS re-push.
+                    Err(error) => return Err(error),
                 }
                 tokio::fs::remove_dir_all(path).await.map_err(|error| {
                     GitError::other("init", format!("cannot remove corrupt cache: {error}"))
@@ -622,10 +687,7 @@ impl Git for GitRunner {
         );
         async {
             Self::check_remote("lfs_fetch", remote)?;
-            // git-lfs accepts a URL in the remote position, so the cache
-            // repository stores no remote.
-            let mut argv = Self::cache_args(path, ["lfs", "fetch", "--all"]);
-            argv.push((&remote.url).into());
+            let argv = Self::lfs_args(path, "fetch", remote);
             self.exec("lfs_fetch", &span, argv).await.map(|_| ())
         }
         .instrument(span.clone())
@@ -640,8 +702,7 @@ impl Git for GitRunner {
         );
         async {
             Self::check_remote("lfs_push", remote)?;
-            let mut argv = Self::cache_args(path, ["lfs", "push", "--all"]);
-            argv.push((&remote.url).into());
+            let argv = Self::lfs_args(path, "push", remote);
             self.exec("lfs_push", &span, argv).await.map(|_| ())
         }
         .instrument(span.clone())

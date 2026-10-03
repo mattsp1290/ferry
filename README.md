@@ -19,8 +19,15 @@ Git LFS data itself, and reports metrics, logs, and traces to a Datadog Agent.
 | Git LFS objects (per entry, on by default) | Repository settings other than the two below |
 | Description and default branch | Anything from Forgejo back to GitHub |
 
+LFS objects are fetched from the GitHub repository's own LFS endpoint and
+pushed to the Forgejo repository's own endpoint. A `.lfsconfig` in the
+mirrored repository is ignored, so a repository that keeps its objects on an
+external LFS server fails with `lfs`; set `lfs = false` for it.
+
 Ferry creates a missing Forgejo repository as private, with Actions disabled
-unless the entry asks for them. Ferry never deletes a Forgejo repository.
+unless the entry asks for them. The same Actions setting is applied to an
+existing repository that is still completely empty when ferry takes it over.
+Ferry never deletes a Forgejo repository.
 
 ## Which repositories ferry will write to
 
@@ -28,13 +35,16 @@ Ferry writes only to Forgejo repositories that are named in the allowlist
 **and** carry the topic `ferry-mirror`.
 
 - Ferry adds the topic to a repository it creates, and to an existing
-  repository that has no branches or tags.
+  repository that Forgejo reports as empty and that has no branches or tags.
 - An existing repository with content and without the topic is refused. The
   entry reports `dest_unmanaged` until its allowlist entry sets
   `adopt = true`.
 - **Stop switch:** remove the `ferry-mirror` topic from a repository in the
   Forgejo UI and ferry stops writing to it (`dest_unmanaged`). Add the topic
-  back to resume.
+  back to resume. **The stop switch has no effect while the entry sets
+  `adopt = true`**: ferry adds the topic again, with a warning in the log, and
+  keeps mirroring. Remove `adopt` from the entry once the repository carries
+  the topic.
 - A Forgejo pull mirror is never written to (`dest_is_pull_mirror`).
 
 ## Configuration
@@ -43,7 +53,7 @@ One TOML file. `examples/ferry.toml` is a complete example.
 
 ```toml
 [sync]
-poll_interval_seconds = 300      # minimum 30
+poll_interval_seconds = 300      # 30..=86400
 metadata_interval_seconds = 3600 # minimum 300; how often the description is re-read
 max_concurrency = 2              # 1..=8 repositories in flight
 git_timeout_seconds = 1800       # per git child process
@@ -79,6 +89,10 @@ config file:
 | `FERRY_FORGEJO_TOKEN_FILE` | for `run` and `sync` | Forgejo token. Scopes: `write:repository`, plus `write:user` or `write:organization` for the destination owners. |
 | `FERRY_GITHUB_TOKEN_FILE` | no | Read-only GitHub token. Unset, missing, or empty means unauthenticated access, which is enough for public repositories. |
 | `FERRY_CONFIG` | no | Config path when `--config` is absent. Default `/etc/ferry/ferry.toml`. |
+
+Restart ferry after replacing a token. The API clients and the list of values
+redacted from git output load the token once at start; only the git
+credential helper re-reads the file.
 
 Telemetry uses the standard Datadog variables. Each signal is off when its
 URL is unset.
@@ -143,7 +157,8 @@ kinds:
 | `timeout`, `network`, `rate_limited`, `internal` | As named. |
 
 A failing entry backs off exponentially from the poll interval up to one hour
-and never blocks other entries.
+and never blocks other entries. A forge that answers with `Retry-After` can
+extend the wait beyond that, up to six hours.
 
 ## Tests
 
@@ -163,5 +178,4 @@ ignored by default; its header lists the environment it needs.
 - `docker/` and `scripts/` build the runtime image.
 - `datadog/` holds the monitors and the dashboard, applied with `pup`.
 
-The design and its rationale are in
-`.agents/plans/github-forgejo-sync-worker/`.
+`AGENTS.md` has the contributor rules and the invariants the code must keep.

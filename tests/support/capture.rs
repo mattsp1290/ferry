@@ -4,12 +4,12 @@ use std::io::{self, Write};
 use std::sync::{Arc, Mutex};
 
 use ferry::telemetry::logging::JsonLogLayer;
-use ferry::telemetry::tracing::{OperationNameProcessor, otel_layer};
+use ferry::telemetry::tracing::OperationNameProcessor;
 use opentelemetry::Value;
 use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracerProvider, SpanData};
 use tracing::Dispatch;
+use tracing_subscriber::EnvFilter;
 use tracing_subscriber::fmt::MakeWriter;
-use tracing_subscriber::layer::SubscriberExt;
 
 /// A `MakeWriter` that appends to a shared buffer.
 #[derive(Clone, Default)]
@@ -58,17 +58,23 @@ pub fn memory_provider() -> (SdkTracerProvider, InMemorySpanExporter) {
     (provider, exporter)
 }
 
-/// A dispatch with the JSON log layer and the OTel layer over `provider`.
+/// A dispatch with the JSON log layer and the OTel layer over `provider`,
+/// assembled exactly as production does, with the log level at `debug`.
 pub fn json_dispatch(capture: &Capture, provider: &SdkTracerProvider) -> Dispatch {
-    Dispatch::new(
-        tracing_subscriber::registry()
-            .with(JsonLogLayer::new(
-                capture.clone(),
-                "ferry".to_owned(),
-                Some("test".to_owned()),
-                "1.2.3".to_owned(),
-            ))
-            .with(otel_layer(provider)),
+    json_dispatch_at(capture, provider, "debug")
+}
+
+/// Like `json_dispatch` with an explicit `FERRY_LOG_LEVEL` directive.
+pub fn json_dispatch_at(capture: &Capture, provider: &SdkTracerProvider, level: &str) -> Dispatch {
+    ferry::telemetry::compose(
+        JsonLogLayer::new(
+            capture.clone(),
+            "ferry".to_owned(),
+            Some("test".to_owned()),
+            "1.2.3".to_owned(),
+        ),
+        EnvFilter::new(level),
+        Some(provider),
     )
 }
 

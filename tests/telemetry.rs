@@ -24,7 +24,7 @@ use ferry::telemetry::logging::dd_ids;
 use ferry::telemetry::metrics::{ConstTags, DogstatsdMetrics, DogstatsdTarget};
 use ferry::telemetry::tracing::{build_datadog_provider, mark_error, otel_layer, parse_agent_url};
 use ferry::telemetry::{LogFormat, Metrics, Settings, Telemetry};
-use support::capture::{Capture, attr, attr_str, json_dispatch, memory_provider};
+use support::capture::{Capture, attr, attr_str, json_dispatch, json_dispatch_at, memory_provider};
 
 // ---------------------------------------------------------------------------
 // helpers
@@ -257,21 +257,26 @@ fn dogstatsd_udp_socket_is_recreated_after_the_rotation_interval() {
         .unwrap();
     let (_, first_peer) = server.recv_from(&mut buf).unwrap();
 
-    // Past the interval, the next send starts a background refresh; it still
-    // goes out on the old socket.
-    std::thread::sleep(Duration::from_millis(250));
-    metrics.heartbeat();
-    let (_, still_first) = server.recv_from(&mut buf).unwrap();
-    assert_eq!(still_first, first_peer);
-
-    // After the refresh the new socket (new source port) carries the sends.
-    std::thread::sleep(Duration::from_millis(500));
-    metrics.heartbeat();
-    let (n, new_peer) = server.recv_from(&mut buf).unwrap();
-    assert_eq!(
-        std::str::from_utf8(&buf[..n]).unwrap(),
-        format!("ferry.heartbeat:1|g|#{CONST_TAGS}")
-    );
+    // Past the interval, a send starts a background refresh and later sends
+    // use the new socket (new source port). Poll instead of guessing how long
+    // the refresh thread takes.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let new_peer = loop {
+        std::thread::sleep(Duration::from_millis(120));
+        metrics.heartbeat();
+        let (n, peer) = server.recv_from(&mut buf).unwrap();
+        assert_eq!(
+            std::str::from_utf8(&buf[..n]).unwrap(),
+            format!("ferry.heartbeat:1|g|#{CONST_TAGS}")
+        );
+        if peer.port() != first_peer.port() {
+            break peer;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the socket was never re-created"
+        );
+    };
     assert_ne!(new_peer.port(), first_peer.port(), "socket was re-created");
     assert_eq!(metrics.send_error_count(), 0);
 }
@@ -575,6 +580,59 @@ async fn emit_and_shutdown(agent_url: &str) {
     })
     .await
     .unwrap();
+}
+
+/// Raising the log level must not strip the repository and the trace ID
+/// from the error lines that remain.
+#[test]
+fn error_lines_above_info_keep_span_fields_and_correlation_ids() {
+    let capture = Capture::default();
+    let (provider, exporter) = memory_provider();
+    let dispatch = json_dispatch_at(&capture, &provider, "warn");
+    with_default(&dispatch, || {
+        let span = info_span!("ferry.sync_repo", repo = "owner/alpha");
+        let _entered = span.enter();
+        info!("filtered out");
+        ::tracing::error!(error_kind = "network", "sync failed");
+    });
+
+    let lines = capture.json_lines();
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert_eq!(lines[0]["message"], "sync failed");
+    assert_eq!(lines[0]["repo"], "owner/alpha");
+    let span = &exporter.get_finished_spans().unwrap()[0];
+    let (trace_id, span_id) = dd_ids(span.span_context.trace_id(), span.span_context.span_id());
+    assert_eq!(lines[0]["dd.trace_id"], trace_id.as_str());
+    assert_eq!(lines[0]["dd.span_id"], span_id.as_str());
+}
+
+/// With the Agent down the exporter crates log every failed export. Those
+/// lines are limited so that they cannot bury real sync failures.
+#[test]
+fn exporter_error_lines_are_throttled() {
+    let capture = Capture::default();
+    let (provider, _exporter) = memory_provider();
+    let dispatch = json_dispatch(&capture, &provider);
+    with_default(&dispatch, || {
+        for _ in 0..5 {
+            ::tracing::error!(target: "libdd_trace_utils::send_with_retry", "Max retries exceeded");
+            ::tracing::error!(target: "libdd_data_pipeline::trace_exporter", "Error sending traces");
+        }
+        ::tracing::error!("sync failed");
+        ::tracing::error!("sync failed");
+    });
+
+    let lines = capture.json_lines();
+    let from_exporter = lines
+        .iter()
+        .filter(|line| {
+            line["target"]
+                .as_str()
+                .is_some_and(|t| t.starts_with("libdd_"))
+        })
+        .count();
+    assert_eq!(from_exporter, 1, "{lines:?}");
+    assert_eq!(lines.len(), 3, "ferry's own lines are never throttled");
 }
 
 /// The log level must not decide whether a sync is traced.

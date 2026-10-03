@@ -243,10 +243,12 @@ async fn sync_completes_with_telemetry_disabled() {
         guard.metrics().as_ref(),
         std::slice::from_ref(&entry),
         2,
+        &CancellationToken::new(),
     )
     .await;
 
-    assert_eq!(outcomes[0].result, SyncResult::Synced, "{outcomes:?}");
+    let outcome = outcomes[0].as_ref().expect("the entry ran");
+    assert_eq!(outcome.result, SyncResult::Synced, "{outcome:?}");
     assert_eq!(world.dest_refs(&entry), source.refs());
 }
 
@@ -334,18 +336,17 @@ async fn last_success_age_grows_until_the_first_success() {
         shutdown.clone(),
     ));
 
-    // The only sync so far failed at 10 s. The retry is due at 310 s.
-    tokio::time::sleep(Duration::from_secs(305)).await;
+    // The only sync so far failed at once. The retry is due at 300 s.
+    tokio::time::sleep(Duration::from_secs(295)).await;
     let before = repo_states(&metrics);
     let ages: Vec<u64> = before.iter().map(|(age, _)| age.as_secs()).collect();
-    assert_eq!(ages, (0..=10).map(|n| n * 30).collect::<Vec<_>>());
-    assert_eq!(before.first().expect("first").1, 0);
+    assert_eq!(ages, (0..=9).map(|n| n * 30).collect::<Vec<_>>());
     assert_eq!(before.last().expect("last").1, 1, "one failure so far");
 
-    // The retry at 310 s succeeds.
-    tokio::time::sleep(Duration::from_secs(30)).await;
+    // The retry at 300 s succeeds.
+    tokio::time::sleep(Duration::from_secs(40)).await;
     let (age, failures) = *repo_states(&metrics).last().expect("state");
-    assert_eq!(age, Duration::from_secs(20));
+    assert_eq!(age, Duration::from_secs(30));
     assert!(age < poll_interval);
     assert_eq!(failures, 0);
 

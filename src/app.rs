@@ -9,6 +9,7 @@
 use std::fmt::Display;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::signal::unix::{SignalKind, signal};
 use tokio_util::sync::CancellationToken;
@@ -23,6 +24,9 @@ use crate::scheduler::{
 };
 use crate::sync::{RepoSyncer, SyncContext};
 use crate::telemetry::{Metrics, Settings, Telemetry};
+
+/// How long process exit waits for blocking tasks that are still running.
+const RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// A failed command and the exit code it maps to.
 #[derive(Debug)]
@@ -102,7 +106,13 @@ fn execute(config: Config, entries: Vec<RepoEntry>, mode: Mode) -> u8 {
         .enable_all()
         .build()
         .map_err(|error| Failure::runtime(format!("cannot start the async runtime: {error}")))
-        .and_then(|runtime| runtime.block_on(start(&config, entries, mode, metrics)));
+        .and_then(|runtime| {
+            let result = runtime.block_on(start(&config, entries, mode, metrics));
+            // Dropping the runtime would wait for a blocking cache size scan,
+            // which can take minutes on a large cache.
+            runtime.shutdown_timeout(RUNTIME_SHUTDOWN_TIMEOUT);
+            result
+        });
 
     let code = match result {
         Ok(code) => code,
@@ -280,11 +290,14 @@ async fn once(
         metrics.as_ref(),
         &entries,
         config.sync.max_concurrency,
+        &cancel_syncs,
     );
     tokio::pin!(pass);
     let outcomes = tokio::select! {
         outcomes = &mut pass => outcomes,
         () = interrupted.cancelled() => {
+            // Stops the running git children and keeps the remaining entries
+            // from starting.
             cancel_syncs.cancel();
             pass.await;
             return Err(Failure::runtime("interrupted"));
@@ -293,7 +306,11 @@ async fn once(
 
     let failed = outcomes
         .iter()
-        .filter(|outcome| !outcome.result.is_success())
+        .filter(|outcome| {
+            !outcome
+                .as_ref()
+                .is_some_and(|outcome| outcome.result.is_success())
+        })
         .count();
     tracing::info!(repos = entries.len(), failed, "sync pass finished");
     Ok(if failed == 0 {

@@ -267,10 +267,20 @@ fn monitors_have_tags_scope_and_no_notification_handle() {
         let query = m["query"].as_str().expect("query");
         assert!(query.contains("{service:ferry}"), "{name}: query scope");
         let message = m["message"].as_str().expect("message");
-        assert!(
-            !message.contains('@'),
-            "{name}: message has a notification handle"
-        );
+        // A handle is a word like `@team-ops`. A log attribute filter such
+        // as `@repo:{{repo.name}}` also starts with `@` but has a colon.
+        let handle = message
+            .split_whitespace()
+            .find(|word| word.starts_with('@') && !word.contains(':'));
+        assert_eq!(handle, None, "{name}: message has a notification handle");
+        if message.contains("repo:{{repo.name}}") {
+            // `repo` is a log attribute, not a tag: without `@` the search
+            // the runbook tells the operator to run matches nothing.
+            assert!(
+                message.contains("@repo:{{repo.name}}"),
+                "{name}: the log query must use the @repo attribute"
+            );
+        }
         assert!(
             m["name"].as_str().is_some_and(|n| !n.contains('@')),
             "{name}: name has @"

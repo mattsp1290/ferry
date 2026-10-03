@@ -79,6 +79,8 @@ trap 'rm -rf "$work"' EXIT
 # Archiving the file path alone adds no parent directory entries.
 mkdir -p "$work/stage/usr/local/bin"
 install -m 0755 "$binary" "$work/stage/usr/local/bin/ferry"
+# A fixed modification time: the same binary must give the same layer digest.
+TZ=UTC touch -t 198001010000.00 "$work/stage/usr/local/bin/ferry"
 export COPYFILE_DISABLE=1 # keeps macOS tar from adding AppleDouble entries
 if tar --version 2>&1 | grep -qi bsdtar; then
   # bsdtar has no --owner/--mode; the mode comes from the staged file.
@@ -93,16 +95,14 @@ entries=$(tar -tf "$work/layer.tar")
 
 target="$repository:${tags[0]}"
 
-# crane append pushes base + layer and prints the new digest (to stderr here);
-# crane mutate then rewrites the manifest in the registry with the runtime
-# settings and pushes it under the same tag.
-crane append $(insecure_flag "$base" "$target") "${platform[@]}" \
-  -b "$base" -f "$work/layer.tar" -t "$target" >&2
-crane mutate $(insecure_flag "$target") "${platform[@]}" \
+# One push: the layer and the runtime settings go into the same manifest, so
+# the tag never points at an image without the entrypoint and the user.
+crane mutate $(insecure_flag "$base" "$target") "${platform[@]}" \
+  --append "$work/layer.tar" \
   --entrypoint /usr/bin/tini,--,/usr/local/bin/ferry \
   --cmd run \
   -u "$RUN_USER" \
-  -t "$target" "$target" >&2
+  -t "$target" "$base" >&2
 
 for tag in "${tags[@]:1}"; do
   crane tag $(insecure_flag "$target") "$target" "$tag" >&2

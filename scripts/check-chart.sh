@@ -5,6 +5,7 @@
 # against the rendered ferry.toml.
 #
 #   FERRY_BIN=/path/to/ferry scripts/check-chart.sh
+#   FERRY_CHART_STRICT=1 scripts/check-chart.sh   # a skipped check fails
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -19,6 +20,15 @@ trap 'rm -rf "$work"' EXIT
 failures=0
 ok() { echo "ok: $*"; }
 fail() { echo "FAIL: $*"; failures=$((failures + 1)); }
+# A skipped check is a failure when FERRY_CHART_STRICT=1. CI sets it, so that
+# a missing ferry binary cannot quietly drop the check-config assertions.
+skip() {
+  if [ "${FERRY_CHART_STRICT:-}" = 1 ]; then
+    fail "$* (skipped, but FERRY_CHART_STRICT=1)"
+  else
+    echo "SKIP: $*"
+  fi
+}
 
 # check <description> <command...>: ok when the command succeeds.
 check() {
@@ -103,6 +113,10 @@ for transport in socket service none; do
   check "$label startup probe on /healthz" test "$(probe_path "$out" startupProbe)" = /healthz
   check "$label liveness probe on /healthz" test "$(probe_path "$out" livenessProbe)" = /healthz
   check "$label readiness probe on /readyz" test "$(probe_path "$out" readinessProbe)" = /readyz
+  check "$label main container runs as non-root" grep -q 'runAsNonRoot: true' "$out"
+  check "$label read-only root filesystem" grep -q 'readOnlyRootFilesystem: true' "$out"
+  check "$label drops all capabilities" grep -qE '^ +drop: \["ALL"\]$' "$out"
+  check_not "$label no privilege escalation" grep -q 'allowPrivilegeEscalation: true' "$out"
   check "$label automountServiceAccountToken false" grep -q 'automountServiceAccountToken: false' "$out"
   check "$label terminationGracePeriodSeconds 40" grep -q 'terminationGracePeriodSeconds: 40' "$out"
   check "$label checksum/config annotation" grep -qE 'checksum/config: "?[0-9a-f]{64}"?$' "$out"
@@ -138,7 +152,7 @@ for transport in socket service none; do
       cat "$work/$transport.toml"
     fi
   else
-    echo "SKIP: $label check-config (no ferry binary; set FERRY_BIN or run cargo build)"
+    skip "$label check-config (no ferry binary; set FERRY_BIN or run cargo build)"
   fi
 done
 
@@ -157,11 +171,17 @@ fi
 # Integer overrides must stay integers in ferry.toml.
 if [ -n "$ferry_bin" ]; then
   int="$work/int.yaml"
-  helm template ferry "$chart" "${common[@]}" --set config.sync.poll_interval_seconds=600 \
-    --set config.sync.max_concurrency=4 -s templates/configmap.yaml >"$int"
-  extract_toml "$int" >"$work/int.toml"
-  check "integer --set override renders as an integer" grep -qx 'poll_interval_seconds = 600' "$work/int.toml"
-  check "integer --set override passes check-config" "$ferry_bin" check-config --config "$work/int.toml"
+  if helm template ferry "$chart" "${common[@]}" --set config.sync.poll_interval_seconds=600 \
+    --set config.sync.max_concurrency=4 -s templates/configmap.yaml >"$int" 2>&1; then
+    extract_toml "$int" >"$work/int.toml"
+    check "integer --set override renders as an integer" grep -qx 'poll_interval_seconds = 600' "$work/int.toml"
+    check "integer --set override passes check-config" "$ferry_bin" check-config --config "$work/int.toml"
+  else
+    fail "integer --set override render"
+    cat "$int"
+  fi
+else
+  skip "integer --set override (no ferry binary)"
 fi
 
 # Required values and validation fail with a message naming the value.
