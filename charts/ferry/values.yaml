@@ -1,0 +1,26 @@
+image:
+  repository: ""        # live: localhost:30001/ferry/ferry
+  digest: ""            # required; the template fails when empty (sha256:...)
+  pullPolicy: IfNotPresent
+  # Value of DD_VERSION and the tags.datadoghq.com/version pod label.
+  # Empty means the chart appVersion. CI deployments set the image git SHA.
+  version: ""
+credentialsSecret: ferry-credentials   # keys: forgejo-token, github-token
+datadog:
+  env: homelab
+  transport: socket     # socket | service | none; G2 selects the live value
+  agentService: datadog-agent.default.svc.cluster.local
+  socketHostPath: /var/run/datadog
+config:                 # rendered to ferry.toml; same schema as src/config.rs
+  sync: { poll_interval_seconds: 300, cache_dir: /var/lib/ferry/cache }
+  forgejo: { url: https://git.birb.homes, username: ferry }
+  repos: []
+cache:
+  storageClass: local-path
+  size: 20Gi
+  fixPermissions: false   # true adds an initContainer that chowns the cache to 10001
+nodeSelector:
+  kubernetes.io/arch: amd64
+resources:
+  requests: { cpu: 100m, memory: 128Mi }
+  limits: { cpu: 1000m, memory: 1Gi }

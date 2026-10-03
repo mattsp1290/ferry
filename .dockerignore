@@ -1,0 +1,6 @@
+# dist/ must stay: docker/Dockerfile copies the prebuilt binary from it.
+target
+.git
+.agents
+.claude
+reviews
