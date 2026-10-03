@@ -42,6 +42,8 @@ opentelemetry_sdk = { version = "0.32", features = ["testing"] }
 tempfile = "3"
 tokio = { version = "1.53", features = ["test-util"] }
 toml = "1.1"
+# `ServiceExt::oneshot` drives the health router under a paused clock.
+tower = { version = "0.5", features = ["util"] }
 wiremock = "0.6"
 
 [profile.release]
