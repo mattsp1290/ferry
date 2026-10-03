@@ -1,0 +1,33 @@
+# Example ferry configuration. Every key is shown with its default, except
+# [forgejo], which is required, and [[repos]], which uses placeholder names.
+
+[sync]
+poll_interval_seconds = 300      # minimum 30
+metadata_interval_seconds = 3600 # minimum 300
+max_concurrency = 2              # 1..=8
+git_timeout_seconds = 1800       # per git child process
+cache_dir = "/var/lib/ferry/cache"
+
+[github]
+api_url = "https://api.github.com"
+git_url = "https://github.com"
+
+[forgejo]
+url = "https://git.example.com"
+username = "ferry"               # basic-auth username paired with the token
+
+[health]
+listen = "0.0.0.0:8080"
+
+# One block per mirrored repository.
+[[repos]]
+github = "example-owner/example-repo"     # required: GitHub owner/name
+forgejo = "example-owner/example-repo"    # required: Forgejo owner/name
+lfs = true                                # default true
+actions = false                           # default false: Actions stay off on a repository ferry creates
+adopt = false                             # default false: refuse an existing, non-empty, unmarked repository
+
+[[repos]]
+github = "example-owner/second-repo"
+forgejo = "mirrors/second-repo"
+lfs = false
