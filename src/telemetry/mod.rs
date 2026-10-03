@@ -22,8 +22,9 @@ use std::io;
 use std::sync::Arc;
 
 use ::tracing::Dispatch;
+use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::fmt::MakeWriter;
-use tracing_subscriber::layer::{Layered, SubscriberExt};
+use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::{EnvFilter, Layer, Registry};
 
 pub use logging::JsonLogLayer;
@@ -129,7 +130,11 @@ impl Settings {
 /// Entry point for telemetry setup.
 pub struct Telemetry;
 
-type Base = Layered<EnvFilter, Registry>;
+type Base = Registry;
+
+/// Spans and span events at this level and above are exported as traces,
+/// whatever the log level is.
+const TRACE_LEVEL: LevelFilter = LevelFilter::INFO;
 
 impl Telemetry {
     /// Installs the global subscriber (level filter, JSON or text logs on
@@ -209,10 +214,14 @@ impl Telemetry {
                 .with_ansi(false)
                 .boxed(),
         };
-        let otel = provider.as_ref().map(tracing::otel_layer);
+        // The level filter belongs to the log layer alone. As a global filter
+        // it would also drop the spans, and `FERRY_LOG_LEVEL=warn` would then
+        // silently turn tracing off. Ferry exports every sync as a trace.
+        let otel = provider
+            .as_ref()
+            .map(|provider| tracing::otel_layer(provider).with_filter(TRACE_LEVEL));
         let subscriber = tracing_subscriber::registry()
-            .with(filter)
-            .with(log_layer)
+            .with(log_layer.with_filter(filter))
             .with(otel);
         let dispatch = Dispatch::new(subscriber);
 

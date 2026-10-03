@@ -479,10 +479,11 @@ pub async fn run_emitter(
     let mut ticker = tokio::time::interval(config.interval);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut last_cache_scan: Option<Instant> = None;
+    let mut cache_scan: Option<tokio::task::JoinHandle<()>> = None;
 
     loop {
         tokio::select! {
-            () = shutdown.cancelled() => return,
+            () = shutdown.cancelled() => break,
             _ = ticker.tick() => {}
         }
 
@@ -501,14 +502,32 @@ pub async fn run_emitter(
 
         let scan_due = last_cache_scan
             .is_none_or(|last| now.saturating_duration_since(last) >= config.cache_scan_interval);
-        if let Some(cache_dir) = config.cache_dir.as_ref().filter(|_| scan_due) {
+        let scan_running = cache_scan.as_ref().is_some_and(|scan| !scan.is_finished());
+        if let Some(cache_dir) = config
+            .cache_dir
+            .as_ref()
+            .filter(|_| scan_due && !scan_running)
+        {
             last_cache_scan = Some(now);
-            let cache_dir = cache_dir.clone();
-            match tokio::task::spawn_blocking(move || directory_bytes(&cache_dir)).await {
-                Ok(bytes) => metrics.cache_bytes(bytes),
-                Err(error) => tracing::warn!(error = %error, "cache size scan failed"),
-            }
+            // Walking a large LFS cache can take longer than the emit
+            // interval. It runs on its own task so that it never delays the
+            // heartbeat, which a monitor alerts on.
+            cache_scan = Some(tokio::spawn(scan_cache(
+                Arc::clone(&metrics),
+                cache_dir.clone(),
+            )));
         }
+    }
+
+    if let Some(scan) = cache_scan {
+        scan.abort();
+    }
+}
+
+async fn scan_cache(metrics: Arc<dyn Metrics>, cache_dir: PathBuf) {
+    match tokio::task::spawn_blocking(move || directory_bytes(&cache_dir)).await {
+        Ok(bytes) => metrics.cache_bytes(bytes),
+        Err(error) => tracing::warn!(error = %error, "cache size scan failed"),
     }
 }
 

@@ -23,7 +23,7 @@ Additional checks for the areas they cover:
 | Chart | `helm lint charts/ferry --set image.repository=x --set image.digest=sha256:0 && scripts/check-chart.sh` | `helm` |
 | Cross-build | `scripts/build-binaries.sh` | `zig`, `cargo-zigbuild` |
 | Live acceptance | `cargo test --test live_acceptance -- --ignored` | real tokens, LAN; see the test's header |
-| Secret hygiene | `git grep -nE 'ghp_\|github_pat_\|-----BEGIN'` returns nothing | — |
+| Secret hygiene | `git grep -nE 'ghp_\|github_pat_\|-----BEGIN' -- ':!AGENTS.md' ':!.agents'` returns nothing | — |
 
 Without `FERRY_TEST_LFS=1` the LFS cases print a skip line instead of running.
 
@@ -74,6 +74,34 @@ The cache repository stores no remote and no credential.
   "latest": `datadog-opentelemetry 0.5.2` needs `opentelemetry 0.32.x`,
   `opentelemetry_sdk 0.32.x`, and `tracing-opentelemetry 0.33.x`.
   `cargo tree -d` must list no duplicate `opentelemetry` or `opentelemetry_sdk`.
+- Every repository sync is one trace with root span `ferry.sync_repo`.
+  Create spans with `tracing::info_span!`; span fields become Datadog tags.
+  Never put a URL with a query, a header, a token, or git stderr in a field.
+- Datadog's operation name is not the OpenTelemetry span name. The tracer
+  provider installs `OperationNameProcessor`, which copies the span name into
+  the `operation.name` attribute. Without it every span is named `internal`
+  and `operation_name:ferry.sync_repo` matches nothing.
+- Log and trace correlation: `dd.trace_id` is the low 64 bits of the 128-bit
+  OpenTelemetry trace ID as a decimal string, and `dd.span_id` is the 64-bit
+  span ID as a decimal string. This is what `datadog-opentelemetry 0.5.2`
+  sends to the Agent as the Datadog trace and span IDs
+  (`src/mappings/transform/mod.rs`: `otel_trace_id_to_dd_id`,
+  `otel_span_id_to_dd_id`). `telemetry::logging::dd_ids` implements it.
+- `FERRY_LOG_LEVEL` filters log lines only. Spans at `info` and above are
+  exported whatever the log level is.
+
+### Tracing spike record (plan WP6, step 0)
+
+| Item | Result | Evidence |
+|---|---|---|
+| 1. Versions resolve without duplicates | pass | `cargo tree -d` lists no `opentelemetry*` crate |
+| 2. A `tracing` span reaches the Datadog exporter | pass | `tests/telemetry.rs`: `datadog_provider_exports_to_an_http_agent` |
+| 3. `http://` and `unix://` agent URLs | pass | same file: `…_http_agent`, `…_unix_socket_agent` |
+| 4. Correlation ID encoding | recorded above | `json_log_flattens_span_fields_and_adds_dd_ids_matching_the_exported_span` |
+| 5. `cargo zigbuild` for `x86_64-unknown-linux-gnu.2.36` | pass | `scripts/build-binaries.sh` on macOS arm64 |
+| 6. A span arrives in Datadog through the real Agent | **not run** | needs gate G1 (`pup auth login`) and a port-forward to the Agent |
+
+Item 6 must pass before the first cluster rollout.
 
 ## Code conventions
 

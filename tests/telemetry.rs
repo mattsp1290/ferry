@@ -577,6 +577,60 @@ async fn emit_and_shutdown(agent_url: &str) {
     .unwrap();
 }
 
+/// The log level must not decide whether a sync is traced.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn log_level_above_info_still_exports_traces() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/info"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(INFO_JSON, "application/json"))
+        .mount(&server)
+        .await;
+    Mock::given(wiremock::matchers::any())
+        .respond_with(ResponseTemplate::new(200).set_body_raw(TRACES_JSON, "application/json"))
+        .mount(&server)
+        .await;
+
+    let capture = Capture::default();
+    let (mut guard, dispatch) = Telemetry::build(
+        Settings {
+            env: Some("test".to_owned()),
+            version: "1.2.3".to_owned(),
+            trace_agent_url: Some(server.uri()),
+            log_level: "error".to_owned(),
+            ..Settings::default()
+        },
+        capture.clone(),
+    );
+    assert!(guard.tracing_enabled());
+    with_default(&dispatch, || {
+        emit_sync_span();
+        info!("filtered out of the log");
+    });
+    tokio::task::spawn_blocking(move || guard.shutdown())
+        .await
+        .unwrap();
+
+    assert_eq!(
+        capture.text(),
+        "",
+        "info lines must be filtered from the log"
+    );
+    let received = server.received_requests().await.unwrap();
+    let requests: Vec<AgentRequest> = received
+        .iter()
+        .map(|r| AgentRequest {
+            method: r.method.to_string(),
+            path: r.url.path().to_owned(),
+            body: r.body.clone(),
+        })
+        .collect();
+    assert_trace_payload(&requests);
+}
+
 fn assert_trace_payload(requests: &[AgentRequest]) {
     let traces: Vec<_> = requests.iter().filter(|r| is_trace_payload(r)).collect();
     assert!(

@@ -133,8 +133,10 @@ async fn start(
 
     let runner = GitRunner::from_config(config, &token_files, &tokens, cancel_syncs.clone())
         .map_err(Failure::runtime)?;
-    check_tools(&runner, &entries).await?;
+    // The cache directory comes first: the git runner keeps its HOME there,
+    // so an unusable cache would otherwise be reported as a missing git.
     check_cache_dir(config).await?;
+    check_tools(&runner, &entries).await?;
 
     let syncer = Arc::new(RepoSyncer::new(sync_context(config, runner, &tokens)?));
     match mode {
