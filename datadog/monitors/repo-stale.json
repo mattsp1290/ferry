@@ -1,0 +1,23 @@
+{
+  "name": "[ferry] Repository {{repo.name}} has not synced successfully",
+  "type": "metric alert",
+  "query": "min(last_10m):min:ferry.repo.last_success_age_seconds{service:ferry} by {repo} > 3600",
+  "message": "{{#is_alert}}Ferry has not mirrored {{repo.name}} from GitHub to Forgejo for over 1 hour (stale critical = 12 x poll interval, assuming the default 300 s poll interval). The Forgejo copy is falling behind.\n\nFirst check: open the \"Ferry: GitHub to Forgejo mirror\" dashboard, filter `repo` to {{repo.name}}, and read the error kinds widget. Then search logs with `service:ferry status:error repo:{{repo.name}}` for the latest failure.\n\nIf the error kind is `dest_unmanaged`, the `ferry-mirror` topic is missing from the Forgejo repository. That is the per-repository stop switch: ferry refuses to write until the topic is restored. If the pause was intentional, remove the entry from the allowlist and resolve this alert by hand. Otherwise restore the topic; a pod restart retries immediately, otherwise the next attempt can be up to 60 minutes away.{{/is_alert}}\n\n{{#is_warning}}Ferry has not mirrored {{repo.name}} for over 30 minutes. If the next sync succeeds this clears by itself. Check the \"Ferry: GitHub to Forgejo mirror\" dashboard for the error kind on this repository.{{/is_warning}}\n\n{{#is_recovery}}{{repo.name}} synced successfully again.{{/is_recovery}}",
+  "tags": [
+    "service:ferry",
+    "managed-by:ferry-repo"
+  ],
+  "priority": 3,
+  "options": {
+    "thresholds": {
+      "critical": 3600,
+      "warning": 1800
+    },
+    "notify_no_data": false,
+    "notify_audit": false,
+    "include_tags": true,
+    "require_full_window": false,
+    "renotify_interval": 0,
+    "evaluation_delay": 60
+  }
+}

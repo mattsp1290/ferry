@@ -1,0 +1,175 @@
+{
+  "title": "Ferry: GitHub to Forgejo mirror",
+  "description": "Sync results, errors, staleness, duration, and worker health for ferry. Managed from datadog/dashboard.json in the ferry repository; edit the file, not the UI.",
+  "layout_type": "ordered",
+  "template_variables": [
+    {
+      "name": "env",
+      "prefix": "env",
+      "default": "*"
+    },
+    {
+      "name": "repo",
+      "prefix": "repo",
+      "default": "*"
+    }
+  ],
+  "widgets": [
+    {
+      "definition": {
+        "type": "timeseries",
+        "title": "Sync results by result",
+        "show_legend": true,
+        "legend_layout": "auto",
+        "requests": [
+          {
+            "q": "sum:ferry.sync.runs{service:ferry,$env,$repo} by {result}.as_count()",
+            "display_type": "bars"
+          }
+        ]
+      }
+    },
+    {
+      "definition": {
+        "type": "toplist",
+        "title": "Error kinds",
+        "requests": [
+          {
+            "q": "sum:ferry.sync.runs{service:ferry,$env,$repo,!error_kind:none} by {error_kind}.as_count()"
+          }
+        ]
+      }
+    },
+    {
+      "definition": {
+        "type": "toplist",
+        "title": "Last success age by repo (seconds)",
+        "requests": [
+          {
+            "q": "max:ferry.repo.last_success_age_seconds{service:ferry,$env,$repo} by {repo}"
+          }
+        ]
+      }
+    },
+    {
+      "definition": {
+        "type": "timeseries",
+        "title": "Sync duration p50 and p95 by repo (seconds)",
+        "show_legend": true,
+        "legend_layout": "auto",
+        "requests": [
+          {
+            "q": "p50:ferry.sync.duration{service:ferry,$env,$repo} by {repo}",
+            "display_type": "line"
+          },
+          {
+            "q": "p95:ferry.sync.duration{service:ferry,$env,$repo} by {repo}",
+            "display_type": "line"
+          }
+        ]
+      }
+    },
+    {
+      "definition": {
+        "type": "timeseries",
+        "title": "Refs changed and pruned by repo",
+        "show_legend": true,
+        "legend_layout": "auto",
+        "requests": [
+          {
+            "q": "sum:ferry.sync.refs_changed{service:ferry,$env,$repo} by {repo}.as_count()",
+            "display_type": "bars"
+          },
+          {
+            "q": "sum:ferry.sync.refs_pruned{service:ferry,$env,$repo} by {repo}.as_count()",
+            "display_type": "bars"
+          }
+        ]
+      }
+    },
+    {
+      "definition": {
+        "type": "timeseries",
+        "title": "Cache bytes",
+        "requests": [
+          {
+            "q": "max:ferry.cache.bytes{service:ferry,$env}",
+            "display_type": "line"
+          }
+        ]
+      }
+    },
+    {
+      "definition": {
+        "type": "query_value",
+        "title": "Repositories configured",
+        "autoscale": true,
+        "precision": 0,
+        "requests": [
+          {
+            "q": "max:ferry.repos.configured{service:ferry,$env}",
+            "aggregator": "last"
+          }
+        ]
+      }
+    },
+    {
+      "definition": {
+        "type": "timeseries",
+        "title": "Heartbeat",
+        "requests": [
+          {
+            "q": "sum:ferry.heartbeat{service:ferry,$env}",
+            "display_type": "bars"
+          }
+        ]
+      }
+    },
+    {
+      "definition": {
+        "type": "log_stream",
+        "title": "Error logs",
+        "query": "service:ferry status:error",
+        "columns": [],
+        "indexes": [],
+        "show_date_column": true,
+        "show_message_column": true,
+        "message_display": "expanded-md",
+        "sort": {
+          "column": "time",
+          "order": "desc"
+        }
+      }
+    },
+    {
+      "definition": {
+        "type": "list_stream",
+        "title": "Sync traces",
+        "requests": [
+          {
+            "response_format": "event_list",
+            "columns": [
+              {
+                "field": "timestamp",
+                "width": "auto"
+              },
+              {
+                "field": "resource_name",
+                "width": "auto"
+              },
+              {
+                "field": "@duration",
+                "width": "auto"
+              }
+            ],
+            "query": {
+              "data_source": "trace_stream",
+              "query_string": "service:ferry operation_name:ferry.sync_repo",
+              "indexes": []
+            }
+          }
+        ]
+      }
+    }
+  ]
+}
