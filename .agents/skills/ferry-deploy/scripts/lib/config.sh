@@ -23,7 +23,6 @@ config_pattern() {
         REGISTRY_INSECURE) pattern='^(true|false)$' ;;
         IMAGE_PULL_REPOSITORY) pattern='^[A-Za-z0-9.-]+(:[0-9]+)?(/[a-z0-9._-]+)+$' ;;
         IMAGE_PUSH_PATH|BASE_PUSH_PATH) pattern='^[a-z0-9._-]+(/[a-z0-9._-]+)*$' ;;
-        NODE_SELECTOR) pattern='^[A-Za-z0-9./_-]+=[A-Za-z0-9._-]+$' ;;
         HELM_TIMEOUT) pattern='^[0-9]+[smh]$' ;;
         *) config_error "$CFG/deploy.env: unknown key $key" ;;
     esac
@@ -52,7 +51,7 @@ config_load() {
     if git -C "$CFG" rev-parse --is-inside-work-tree >/dev/null 2>&1; then config_error "$CFG: must not be inside a git work tree"; fi
     case "$CFG/" in "$REPO_ROOT/"*) config_error "$CFG: must not be under ferry checkout" ;; esac
     [ -f "$CFG/deploy.env" ] || config_error "$CFG/deploy.env: required file missing"
-    unset IMAGE_PUSH_PATH BASE_PUSH_PATH NODE_SELECTOR HELM_TIMEOUT
+    unset IMAGE_PUSH_PATH BASE_PUSH_PATH HELM_TIMEOUT
     while IFS= read -r line || [ -n "$line" ]; do
         case "$line" in ''|'#'*) continue ;; esac
         case "$line" in *=*) key=${line%%=*}; value=${line#*=} ;; *) config_error "$CFG/deploy.env: expected KEY=value" ;; esac
@@ -67,24 +66,14 @@ config_load() {
         case "$seen" in *" $required "*) ;; *) config_error "$CFG/deploy.env: missing required key $required" ;; esac
     done
     IMAGE_PUSH_PATH=${IMAGE_PUSH_PATH:-ferry/ferry}; BASE_PUSH_PATH=${BASE_PUSH_PATH:-ferry/base}
-    NODE_SELECTOR=${NODE_SELECTOR:-kubernetes.io/arch=amd64}; HELM_TIMEOUT=${HELM_TIMEOUT:-5m}
+    HELM_TIMEOUT=${HELM_TIMEOUT:-5m}
     [ -s "$CFG/secrets/forgejo-token" ] || config_error "$CFG/secrets/forgejo-token: required non-empty token file"
     [ -f "$CFG/values.yaml" ] || config_error "$CFG/values.yaml: required file missing"
     [ -d "$CFG/state" ] || config_error "$CFG/state: required directory missing"
-    export CFG SKILL_DIR REPO_ROOT IMAGE_PUSH_PATH BASE_PUSH_PATH NODE_SELECTOR HELM_TIMEOUT
+    export CFG SKILL_DIR REPO_ROOT IMAGE_PUSH_PATH BASE_PUSH_PATH HELM_TIMEOUT
 }
-# No token is stored in a variable: only a descriptor is passed to a child.
-with_token_fd() {
-    local path=$1 fd=$2; shift 2
-    case "$fd" in
-        3) "$@" 3< "$path" ;; 4) "$@" 4< "$path" ;; 5) "$@" 5< "$path" ;;
-        6) "$@" 6< "$path" ;; 7) "$@" 7< "$path" ;; 8) "$@" 8< "$path" ;; 9) "$@" 9< "$path" ;;
-        *) config_error 'with_token_fd: descriptor must be 3 through 9' ;;
-    esac
-}
-ferry_binary() {
-    if [ -n "${FERRY_BIN:-}" ]; then printf '%s\n' "$FERRY_BIN"; else (cd "$REPO_ROOT" && cargo build --locked >&2); printf '%s\n' "$REPO_ROOT/target/debug/ferry"; fi
-}
+source "$SKILL_DIR/scripts/lib/credentials.sh"
+source "$REPO_ROOT/scripts/lib/ferry-binary.sh"
 config_caller=${BASH_SOURCE[1]:-}
 if [ -n "$config_caller" ]; then
     config_caller="$(cd "$(dirname "$config_caller")" && pwd -P)/$(basename "$config_caller")"

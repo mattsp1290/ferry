@@ -6,7 +6,7 @@
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 
-use ferry::sync::{ErrorKind, SyncResult};
+use ferry::sync::ErrorKind;
 use ferry::telemetry::METRIC_NAMES;
 use serde_json::Value;
 
@@ -374,15 +374,10 @@ fn dashboard_has_template_variables_and_scoped_queries() {
 
 #[test]
 fn tag_values_in_queries_are_real() {
-    let results: BTreeSet<&str> = [
-        SyncResult::Synced,
-        SyncResult::Noop,
-        SyncResult::Empty,
-        SyncResult::Error,
-    ]
-    .iter()
-    .map(|r| r.as_str())
-    .collect();
+    let results: BTreeSet<&str> = ["synced", "noop", "empty", "error"]
+        .iter()
+        .copied()
+        .collect();
     let mut kinds: BTreeSet<&str> = ErrorKind::ALL.iter().map(|k| k.as_str()).collect();
     kinds.insert("none");
 

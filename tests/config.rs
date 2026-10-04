@@ -1,7 +1,9 @@
 //! Parsing and validation of `ferry.toml`, and token-file loading.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
+mod support;
+
+use support::ferry_command;
 
 use ferry::config::{
     Config, ConfigError, RepoEntry, TokenFiles, load_forgejo_token, load_github_token,
@@ -319,18 +321,9 @@ fn forgejo_token_is_required() {
 
 // --- check-config through the binary -----------------------------------------
 
-fn ferry() -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_ferry"));
-    command
-        .env_remove("FERRY_CONFIG")
-        .env_remove("FERRY_ASKPASS")
-        .env_remove("FERRY_ALLOW_INSECURE_URLS");
-    command
-}
-
 #[test]
 fn check_config_accepts_the_example() {
-    let output = ferry()
+    let output = ferry_command()
         .args(["check-config", "--config"])
         .arg(example_path())
         .output()
@@ -341,7 +334,7 @@ fn check_config_accepts_the_example() {
 
 #[test]
 fn check_config_reads_the_path_from_env() {
-    let output = ferry()
+    let output = ferry_command()
         .arg("check-config")
         .env("FERRY_CONFIG", example_path())
         .output()
@@ -359,7 +352,7 @@ fn check_config_prints_every_violation_and_exits_2() {
     )
     .expect("write");
 
-    let output = ferry()
+    let output = ferry_command()
         .args(["check-config", "--config"])
         .arg(&path)
         .output()
@@ -372,13 +365,13 @@ fn check_config_prints_every_violation_and_exits_2() {
 
 #[test]
 fn check_config_exits_2_for_an_unreadable_or_empty_file() {
-    let output = ferry()
+    let output = ferry_command()
         .args(["check-config", "--config", "/nonexistent/ferry.toml"])
         .output()
         .expect("runs");
     assert_eq!(output.status.code(), Some(2), "{output:?}");
 
-    let output = ferry()
+    let output = ferry_command()
         .args(["check-config", "--config", "/dev/null"])
         .output()
         .expect("runs");

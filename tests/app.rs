@@ -86,21 +86,7 @@ impl Fixture {
 
     /// The binary with a clean ferry and Datadog environment.
     fn ferry(&self) -> Command {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_ferry"));
-        for name in [
-            "FERRY_CONFIG",
-            "FERRY_ASKPASS",
-            "FERRY_GITHUB_TOKEN_FILE",
-            "FERRY_LOG_FORMAT",
-            "FERRY_LOG_LEVEL",
-            "DD_DOGSTATSD_URL",
-            "DD_TRACE_AGENT_URL",
-            "DD_SERVICE",
-            "DD_ENV",
-            "DD_VERSION",
-        ] {
-            command.env_remove(name);
-        }
+        let mut command = Command::from(support::ferry_command());
         command
             .env("FERRY_ALLOW_INSECURE_URLS", "1")
             .env("FERRY_FORGEJO_TOKEN_FILE", self.token_file())

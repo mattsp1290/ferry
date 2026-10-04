@@ -18,7 +18,7 @@ if config.exists():
     # Validate before reading any environment file. Print only non-secret keys.
     script = '''source .agents/skills/ferry-deploy/scripts/lib/config.sh
 source "$SKILL_DIR/scripts/lib/values.sh"
-for key in CONTROL_SSH REGISTRY_PUSH IMAGE_PULL_REPOSITORY GITOPS_RUNNER_LABEL GITOPS_CI_IMAGE GITOPS_REGISTRY GITOPS_SSH_DESTINATION GITOPS_REGISTRY_LOCAL_URL GITOPS_FORGEJO_LOCAL_URL; do
+for key in CONTROL_SSH REGISTRY_PUSH IMAGE_PULL_REPOSITORY; do
   printf '%s=%s\\n' "$key" "${!key-}"
 done
 merged_values | jq -r '"FORGEJO_URL=" + .config.forgejo.url'
@@ -29,11 +29,11 @@ merged_values | jq -r '"FORGEJO_URL=" + .config.forgejo.url'
         sys.exit(1)
     for setting in result.stdout.splitlines():
         key, _, value = setting.partition('=')
-        if key in ('CONTROL_SSH', 'GITOPS_SSH_DESTINATION'):
+        if key == 'CONTROL_SSH':
             value = value.rsplit('@', 1)[-1]
         elif key == 'IMAGE_PULL_REPOSITORY':
             value = value.split('/', 1)[0]
-        elif key in ('FORGEJO_URL', 'GITOPS_REGISTRY_LOCAL_URL', 'GITOPS_FORGEJO_LOCAL_URL'):
+        elif key == 'FORGEJO_URL':
             value = urllib.parse.urlsplit(value).hostname or ''
         host = value.split(':', 1)[0]
         if (not value or host == 'localhost' or 'example.' in value

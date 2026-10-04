@@ -5,7 +5,7 @@
 
 use std::path::PathBuf;
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 
 /// Env variable that names the config file when `--config` is absent.
 pub const CONFIG_ENV: &str = "FERRY_CONFIG";
@@ -26,8 +26,33 @@ pub struct Cli {
     pub command: Command,
 }
 
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum RefSide {
+    Github,
+    Forgejo,
+}
+
+impl From<RefSide> for crate::git::Side {
+    fn from(side: RefSide) -> Self {
+        match side {
+            RefSide::Github => Self::Github,
+            RefSide::Forgejo => Self::Forgejo,
+        }
+    }
+}
+
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// List the heads and tags of an allowlisted repository without changing it.
+    #[command(hide = true)]
+    Refs {
+        #[arg(long)]
+        config: Option<PathBuf>,
+        #[arg(long, value_enum)]
+        side: RefSide,
+        /// GitHub owner/name of the allowlist entry.
+        repo: String,
+    },
     /// Run the polling scheduler and the health server until terminated.
     Run {
         /// Config file. Defaults to $FERRY_CONFIG, then /etc/ferry/ferry.toml.

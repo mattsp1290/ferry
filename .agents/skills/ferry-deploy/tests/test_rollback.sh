@@ -6,6 +6,8 @@ tmp=$(mktemp -d "${TMPDIR:-/tmp}/ferry-rollback-test.XXXXXX")
 trap 'rm -rf "$tmp"' EXIT
 mkdir -p "$tmp/bin" "$tmp/home" "$tmp/repo/.agents/skills"
 cp -R "$skill" "$tmp/repo/.agents/skills/ferry-deploy"
+mkdir -p "$tmp/repo/scripts/lib"
+cp "$skill/../../../scripts/lib/ferry-binary.sh" "$tmp/repo/scripts/lib/"
 # Isolate selection and locked Helm execution; runtime verification has its
 # own scenario suite and is only asserted to run after a successful rollback.
 printf '#!/usr/bin/env bash\ntouch "$ROLLBACK_TEST_ROOT/verified"\n' > "$tmp/repo/.agents/skills/ferry-deploy/scripts/cmd/verify.sh"

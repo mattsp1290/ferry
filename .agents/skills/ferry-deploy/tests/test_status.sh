@@ -5,7 +5,7 @@ umask 077
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/ferry-status-test.XXXXXX")
 trap 'rm -rf "$tmp"' EXIT
 mkdir -p "$tmp/bin" "$tmp/cfg/state"
-export FERRY_DEPLOY_CONFIG="$tmp/cfg" CONTROL_SSH=control NAMESPACE=ferry RELEASE=ferry KUBECONFIG_PATH=/config HELM_TIMEOUT=5m NODE_SELECTOR=kubernetes.io/arch=amd64 IMAGE_PULL_REPOSITORY=localhost:5000/ferry/ferry
+export FERRY_DEPLOY_CONFIG="$tmp/cfg" CONTROL_SSH=control NAMESPACE=ferry RELEASE=ferry KUBECONFIG_PATH=/config HELM_TIMEOUT=5m IMAGE_PULL_REPOSITORY=localhost:5000/ferry/ferry
 bash "$root/.agents/skills/ferry-deploy/scripts/deploy.sh" init >/dev/null
 printf 'obviously-fake-token\n' > "$tmp/cfg/secrets/forgejo-token"
 chmod 600 "$tmp/cfg/secrets/forgejo-token"
@@ -17,8 +17,8 @@ SH
 chmod +x "$tmp/bin/ssh"
 printf '{"action":"rollout"}\n' > "$tmp/cfg/state/deployments.jsonl"
 : > "$tmp/cfg/state/secret-restart-pending"
-bash "$root/.agents/skills/ferry-deploy/scripts/cmd/status.sh" > "$tmp/output"
+bash "$root/.agents/skills/ferry-deploy/scripts/cmd/status.sh" > "$tmp/output" 2>&1
 grep -q 'rollback ferry 2' "$tmp/output"
 grep -q 'image.digest: sha256:abc' "$tmp/output"
 grep -q 'local log:' "$tmp/output"
-grep -q 'credentials: changed since the pod started; run deploy restart' "$tmp/output"
+grep -q 'credentials changed and the pod has not reloaded them: run deploy restart' "$tmp/output"

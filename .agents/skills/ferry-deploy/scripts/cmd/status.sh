@@ -2,12 +2,11 @@
 set -euo pipefail
 source "$(cd "$(dirname "$0")/../lib" && pwd)/config.sh"
 source "$SKILL_DIR/scripts/lib/remote.sh"
+source "$SKILL_DIR/scripts/lib/state.sh"
 report=$(remote_run status)
-printf '%s' "$report" | jq -r '"release: \(.status.info.status) revision: \(.status.version)", "image.digest: \(.values.image.digest)", "image.version: \(.values.image.version)", (.pods.items[] | "pod: \(.metadata.name) uid: \(.metadata.uid) phase: \(.status.phase) readiness: \([.status.conditions[]? | select(.type == "Ready") | .status][0] // "Unknown") restarts: \([.status.containerStatuses[]?.restartCount] | add // 0) node: \(.spec.nodeName)")'
+printf '%s' "$report" | jq -r -f "$SKILL_DIR/scripts/jq/status.jq"
 state=$(printf '%s' "$report" | jq -r '.status.info.status')
-if [ -f "$CFG/state/secret-restart-pending" ]; then
-    printf 'credentials: changed since the pod started; run deploy restart\n'
-fi
+warn_restart_pending
 case "$state" in
     pending-*|failed)
         revision=$(printf '%s' "$report" | jq -r '[.history[] | select(.status == "deployed" or .status == "superseded")] | sort_by(.revision | tonumber) | last | .revision // empty')

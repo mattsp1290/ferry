@@ -39,7 +39,7 @@ cp "$FERRY_DEPLOY_CONFIG/state/preflight.json" "$STUB_ROOT/preflight.json"
 export STUB_NAMESPACE_UNOWNED=1
 refuse_without_apply rollout
 unset STUB_NAMESPACE_UNOWNED
-for key in namespace release digest control_ssh kubeconfig_path image_pull_repository values_sha256; do
+for key in $(jq -r 'keys[]' "$STUB_ROOT/preflight.json"); do
   jq --arg key "$key" '.[$key]="different"' "$STUB_ROOT/preflight.json" > "$FERRY_DEPLOY_CONFIG/state/preflight.json"
   refuse_without_apply rollout
   grep -q 'run deploy preflight first' "$STUB_ROOT/refused.out"
@@ -136,8 +136,8 @@ for p in pathlib.Path(sys.argv[1]).glob('*.stdin'):
         pod=next(o for o in data['items'] if o['kind']=='Pod')
         if pod['spec']['nodeSelector'].get('topology.kubernetes.io/zone')=='example-zone':
             assert pod['spec']['nodeSelector']['kubernetes.io/arch']=='arm64'
-            assert not any(v['name']=='sockets' for v in pod['spec']['volumes'])
-            assert not any(v['name']=='sockets' for v in pod['spec']['containers'][0]['volumeMounts'])
+            assert not any(v['name']=='datadog-socket' for v in pod['spec']['volumes'])
+            assert not any(v['name']=='datadog-socket' for v in pod['spec']['containers'][0]['volumeMounts'])
             found=True
 assert found
 PYSELECTOR

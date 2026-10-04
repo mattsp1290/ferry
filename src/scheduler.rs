@@ -16,7 +16,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::config::{Config, RepoEntry};
 use crate::health::HealthState;
-use crate::sync::{ErrorKind, SyncOutcome};
+use crate::sync::{ErrorKind, SyncOutcome, SyncStatus};
 use crate::telemetry::Metrics;
 use crate::util::lock;
 
@@ -162,8 +162,8 @@ impl SyncTasks {
     }
 
     /// The next finished task and what it was syncing. A panic in a sync task
-    /// stops at the task boundary and arrives as the `Err`.
-    async fn join_next(&mut self) -> Option<(Running, Result<SyncOutcome, JoinError>)> {
+    /// stops at the task boundary and becomes an `Internal` failure.
+    async fn join_next(&mut self) -> Option<(Running, SyncOutcome)> {
         let joined = self.tasks.join_next_with_id().await?;
         let (id, result) = match joined {
             Ok((id, outcome)) => (id, Ok(outcome)),
@@ -172,7 +172,17 @@ impl SyncTasks {
         // Every task is registered right after it is spawned, so the entry
         // is always there.
         let running = self.running.remove(&id)?;
-        Some((running, result))
+        let outcome = result.unwrap_or_else(|error| {
+            tracing::error!(index = running.index, error = %error, "sync task failed");
+            SyncOutcome {
+                status: SyncStatus::Failed {
+                    kind: ErrorKind::Internal,
+                    retry_after: None,
+                },
+                duration: running.started.elapsed(),
+            }
+        });
+        Some((running, outcome))
     }
 
     async fn shutdown(&mut self) {
@@ -284,7 +294,7 @@ impl Scheduler {
                     self.start_due();
                 }
                 Some((running, result)) = self.syncs.join_next() => {
-                    self.finish_sync(running, result);
+                    self.record(running, result);
                     // Refill the freed slot now instead of at the next tick.
                     self.start_due();
                 }
@@ -345,19 +355,6 @@ impl Scheduler {
         }
     }
 
-    fn finish_sync(&mut self, running: Running, result: Result<SyncOutcome, JoinError>) {
-        let outcome = match result {
-            Ok(outcome) => outcome,
-            // A panic in a sync task counts as a failure of that entry only.
-            Err(error) => {
-                let repo = self.shared.entries()[running.index].repo_tag();
-                tracing::error!(repo, error = %error, "sync task failed");
-                SyncOutcome::error(ErrorKind::Internal, running.started.elapsed())
-            }
-        };
-        self.record(running, outcome);
-    }
-
     fn finish_ready_check(&mut self, result: Result<(), String>) {
         let Readiness::Checking { failures, .. } = self.readiness else {
             return;
@@ -393,7 +390,7 @@ impl Scheduler {
         let poll_interval = self.config.poll_interval;
         let state = &mut self.states[index];
         state.in_flight = false;
-        if outcome.result.is_success() {
+        if outcome.is_success() {
             self.shared.update(index, |status| {
                 *status = EntryStatus {
                     last_success: Some(now),
@@ -408,7 +405,7 @@ impl Scheduler {
             let delay = failure_delay(
                 poll_interval,
                 status.consecutive_failures,
-                outcome.retry_after,
+                outcome.retry_after(),
                 (self.jitter)(),
             );
             state.next_attempt = later(now, delay);
@@ -436,7 +433,7 @@ impl Scheduler {
                 () = &mut grace => break,
                 _ = ticker.tick() => self.health.beat(),
                 joined = self.syncs.join_next() => match joined {
-                    Some((running, result)) => self.finish_sync(running, result),
+                    Some((running, result)) => self.record(running, result),
                     None => return,
                 },
             }
@@ -516,13 +513,9 @@ pub async fn run_once(
             syncs.spawn(&syncer, next, entries[next].clone(), Instant::now());
             next += 1;
         }
-        let Some((Running { index, started }, result)) = syncs.join_next().await else {
+        let Some((Running { index, .. }, outcome)) = syncs.join_next().await else {
             break;
         };
-        let outcome = result.unwrap_or_else(|error| {
-            tracing::error!(error = %error, "sync task failed");
-            SyncOutcome::error(ErrorKind::Internal, started.elapsed())
-        });
         metrics.sync_finished(&entries[index], &outcome);
         outcomes[index] = Some(outcome);
     }

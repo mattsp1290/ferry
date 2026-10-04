@@ -70,7 +70,7 @@ The cache repository stores no remote and no credential.
 
 - Metric names are constants in `src/telemetry/metrics.rs` (`METRIC_NAMES`).
   The files in `datadog/` query them; `tests/datadog_assets.rs` checks that.
-- `SyncResult::as_str` and `ErrorKind::as_str` are metric tag values. Changing
+- `SyncOutcome::result_tag` and `ErrorKind::as_str` are metric tag values. Changing
   one is a telemetry contract change.
 - The OpenTelemetry crate versions follow `datadog-opentelemetry`, not
   "latest": `datadog-opentelemetry 0.5.2` needs `opentelemetry 0.32.x`,

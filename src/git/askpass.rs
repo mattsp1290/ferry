@@ -32,24 +32,37 @@ pub fn requested() -> bool {
     std::env::var(ASKPASS_ENV).is_ok_and(|value| value == "1")
 }
 
-/// Lowercase `host[:port]` of a URL. The port is present only when the URL
-/// carries an explicit non-default one.
-pub fn host_port(url: &str) -> Option<String> {
-    let parsed = Url::parse(url).ok()?;
-    let host = parsed.host_str()?;
-    Some(match parsed.port() {
-        Some(port) => format!("{host}:{port}"),
-        None => host.to_string(),
-    })
+/// Scheme and lowercase `host[:port]` that may receive a credential.
+/// Default ports are elided by URL parsing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Origin {
+    pub scheme: String,
+    pub host: String,
+}
+
+impl Origin {
+    pub fn parse(url: &str) -> Option<Self> {
+        let parsed = Url::parse(url).ok()?;
+        let host = parsed.host_str()?;
+        Some(Self {
+            scheme: parsed.scheme().to_owned(),
+            host: match parsed.port() {
+                Some(port) => format!("{host}:{port}"),
+                None => host.to_ascii_lowercase(),
+            },
+        })
+    }
+
+    fn matches(&self, other: &Self) -> bool {
+        self.scheme == other.scheme && self.host.eq_ignore_ascii_case(&other.host)
+    }
 }
 
 /// What askpass mode reads from its environment.
 #[derive(Debug, Clone, Default)]
 pub struct AskpassEnv {
-    pub github_host: Option<String>,
-    pub github_scheme: Option<String>,
-    pub forgejo_host: Option<String>,
-    pub forgejo_scheme: Option<String>,
+    pub github: Option<Origin>,
+    pub forgejo: Option<Origin>,
     pub forgejo_user: Option<String>,
     pub github_token_file: Option<PathBuf>,
     pub forgejo_token_file: Option<PathBuf>,
@@ -63,11 +76,15 @@ impl AskpassEnv {
                 .filter(|value| !value.is_empty())
                 .map(PathBuf::from)
         };
+        let origin = |host, scheme| {
+            text(host).map(|host| Origin {
+                host: host.to_ascii_lowercase(),
+                scheme: text(scheme).unwrap_or_else(|| "https".into()),
+            })
+        };
         Self {
-            github_host: text(GITHUB_HOST_ENV),
-            github_scheme: Some(text(GITHUB_SCHEME_ENV).unwrap_or_else(|| "https".into())),
-            forgejo_host: text(FORGEJO_HOST_ENV),
-            forgejo_scheme: Some(text(FORGEJO_SCHEME_ENV).unwrap_or_else(|| "https".into())),
+            github: origin(GITHUB_HOST_ENV, GITHUB_SCHEME_ENV),
+            forgejo: origin(FORGEJO_HOST_ENV, FORGEJO_SCHEME_ENV),
             forgejo_user: text(FORGEJO_USER_ENV),
             github_token_file: path(GITHUB_TOKEN_FILE_ENV),
             forgejo_token_file: path(FORGEJO_TOKEN_FILE_ENV),
@@ -81,8 +98,8 @@ enum PromptKind {
     Password,
 }
 
-/// Splits a prompt into its kind and the host of the quoted URL.
-fn parse_prompt(prompt: &str) -> Option<(PromptKind, String, String)> {
+/// Splits a prompt into its kind and the origin of the quoted URL.
+fn parse_prompt(prompt: &str) -> Option<(PromptKind, Origin)> {
     let kind = if prompt.starts_with("Username for") {
         PromptKind::Username
     } else if prompt.starts_with("Password for") {
@@ -96,23 +113,23 @@ fn parse_prompt(prompt: &str) -> Option<(PromptKind, String, String)> {
         return None;
     }
     let url = &prompt[start..end];
-    let scheme = Url::parse(url).ok()?.scheme().to_owned();
-    Some((kind, host_port(url)?, scheme))
+    Some((kind, Origin::parse(url)?))
 }
 
 /// The answer to `prompt`, or `None` when ferry has no credential for it.
 pub fn answer(prompt: &str, env: &AskpassEnv) -> Option<String> {
-    let (kind, host, scheme) = parse_prompt(prompt)?;
-    let host_matches = |configured: &Option<String>| {
-        configured
-            .as_deref()
-            .is_some_and(|value| value.eq_ignore_ascii_case(&host))
-    };
-    let (username, token_file) = if host_matches(&env.github_host)
-        && env.github_scheme.as_deref() == Some(&scheme)
+    let (kind, origin) = parse_prompt(prompt)?;
+    let (username, token_file) = if env
+        .github
+        .as_ref()
+        .is_some_and(|configured| configured.matches(&origin))
     {
         (GITHUB_USERNAME.to_string(), env.github_token_file.as_ref())
-    } else if host_matches(&env.forgejo_host) && env.forgejo_scheme.as_deref() == Some(&scheme) {
+    } else if env
+        .forgejo
+        .as_ref()
+        .is_some_and(|configured| configured.matches(&origin))
+    {
         (env.forgejo_user.clone()?, env.forgejo_token_file.as_ref())
     } else {
         return None;
@@ -149,10 +166,8 @@ mod tests {
         std::fs::write(&gh, "gh-token-not-real\n\n").unwrap();
         std::fs::write(&fj, "fj-token-not-real  \n").unwrap();
         AskpassEnv {
-            github_host: Some("github.com".into()),
-            github_scheme: Some("https".into()),
-            forgejo_host: Some("127.0.0.1:3000".into()),
-            forgejo_scheme: Some("http".into()),
+            github: Origin::parse("https://github.com"),
+            forgejo: Origin::parse("http://127.0.0.1:3000"),
             forgejo_user: Some("ferry".into()),
             github_token_file: Some(gh),
             forgejo_token_file: Some(fj),
@@ -160,21 +175,32 @@ mod tests {
     }
 
     #[test]
-    fn host_port_handles_userinfo_path_and_ports() {
+    fn origin_handles_userinfo_path_and_ports() {
         assert_eq!(
-            host_port("https://github.com").as_deref(),
+            Origin::parse("https://github.com")
+                .map(|origin| origin.host)
+                .as_deref(),
             Some("github.com")
         );
         assert_eq!(
-            host_port("https://x-access-token@GitHub.com/o/r.git").as_deref(),
+            Origin::parse("https://x-access-token@GitHub.com/o/r.git")
+                .map(|origin| origin.host)
+                .as_deref(),
             Some("github.com")
         );
         assert_eq!(
-            host_port("http://u:p@127.0.0.1:3000/a/b").as_deref(),
+            Origin::parse("http://u:p@127.0.0.1:3000/a/b")
+                .map(|origin| origin.host)
+                .as_deref(),
             Some("127.0.0.1:3000")
         );
-        assert_eq!(host_port("https://forge:443/").as_deref(), Some("forge"));
-        assert_eq!(host_port("not a url"), None);
+        assert_eq!(
+            Origin::parse("https://forge:443/")
+                .map(|origin| origin.host)
+                .as_deref(),
+            Some("forge")
+        );
+        assert_eq!(Origin::parse("not a url"), None);
     }
 
     #[test]
@@ -188,6 +214,21 @@ mod tests {
         assert_eq!(
             answer("Password for 'https://x-access-token@github.com': ", &env).as_deref(),
             Some("gh-token-not-real")
+        );
+    }
+
+    #[test]
+    fn credential_origin_normalizes_host_and_default_port_but_rejects_http() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut env = env_with_tokens(dir.path());
+        env.github.as_mut().unwrap().host = "GITHUB.COM".into();
+        assert_eq!(
+            answer("Password for 'https://GitHub.com:443/repo': ", &env).as_deref(),
+            Some("gh-token-not-real")
+        );
+        assert_eq!(
+            answer("Password for 'http://github.com:80/repo': ", &env),
+            None
         );
     }
 

@@ -1,29 +1,18 @@
 #!/usr/bin/env python3
 """Feed curl's header via a pipe descriptor; never argv or environment."""
 import json
-import os
-import subprocess
 import sys
 
+sys.dont_write_bytecode = True
+from credentials import authenticated_get, read_token
+
 url, kind, expected = sys.argv[1:]
-try:
-    with os.fdopen(3, 'rb', closefd=False) as stream:
-        token = stream.read().decode('utf-8').rstrip()
-except (UnicodeError, OSError):
-    sys.exit('Invalid token file contents')
-if not token or any(char in token for char in '\r\n\x00'):
-    sys.exit('Invalid token file contents')
-header = 'Authorization: ' + ('token ' if kind == 'forgejo' else 'Bearer ') + token
-configuration = ('header = "' + header.replace('\\', '\\\\').replace('"', '\\"') + '"\n').encode()
-reader, writer = os.pipe()
-process = subprocess.Popen(['curl', '--disable', '--silent', '--show-error', '--proto', '=https', '--connect-timeout', '15', '--max-time', '30', '--config', '/dev/fd/' + str(reader), '--write-out', '\n%{http_code}', url], pass_fds=(reader,), stdout=subprocess.PIPE)
-os.close(reader)
-with os.fdopen(writer, 'wb') as stream:
-    stream.write(configuration)
-output = process.communicate()[0]
-if process.returncode:
-    sys.exit(1)
-body, _, status = output.rpartition(b'\n')
+body, status = authenticated_get(read_token(3), 'Bearer' if kind == 'github' else 'token', url)
+if kind == 'forgejo-get':
+    if status != b'200':
+        sys.exit(1)
+    sys.stdout.buffer.write(body)
+    sys.exit(0)
 if kind == 'github':
     print('GitHub HTTP status: ' + status.decode())
     sys.exit(0 if status == b'200' else 1)

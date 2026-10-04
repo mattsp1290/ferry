@@ -3,7 +3,7 @@
 //! There is no method here that removes a repository or a topic.
 
 use reqwest::header::AUTHORIZATION;
-use reqwest::{Method, RequestBuilder, StatusCode};
+use reqwest::{Method, StatusCode};
 use serde::{Deserialize, Deserializer, Serialize};
 use tokio::sync::OnceCell;
 use tracing::field::Empty;
@@ -113,25 +113,34 @@ impl ForgejoClient {
         }
     }
 
-    /// Send one request inside a `forgejo.api` span.
-    async fn send(
+    /// Send a bodyless request inside a `forgejo.api` span.
+    async fn get(
+        &self,
+        route: &'static str,
+        segments: &[&str],
+        query: &[(&str, &str)],
+    ) -> Result<Raw, ForgeError> {
+        self.request(Method::GET, route, segments, query, None::<&()>)
+            .await
+    }
+
+    async fn send_json<T: Serialize + ?Sized>(
         &self,
         method: Method,
         route: &'static str,
         segments: &[&str],
-        configure: impl FnOnce(RequestBuilder) -> RequestBuilder,
+        body: Option<&T>,
     ) -> Result<Raw, ForgeError> {
-        self.send_with_query(method, route, segments, &[], configure)
-            .await
+        self.request(method, route, segments, &[], body).await
     }
 
-    async fn send_with_query(
+    async fn request<T: Serialize + ?Sized>(
         &self,
         method: Method,
         route: &'static str,
         segments: &[&str],
         query: &[(&str, &str)],
-        configure: impl FnOnce(RequestBuilder) -> RequestBuilder,
+        body: Option<&T>,
     ) -> Result<Raw, ForgeError> {
         let mut url = build_url(&self.base, segments, route)?;
         if !query.is_empty() {
@@ -143,22 +152,20 @@ impl ForgejoClient {
             http.route = route,
             http.status_code = Empty
         );
-        let req = self
+        let mut request = self
             .http
             .request(method, url)
             .header(AUTHORIZATION, auth_header("token", &self.token, route)?);
-        execute(configure(req), route, span).await
+        if let Some(body) = body {
+            request = request.json(body);
+        }
+        execute(request, route, span).await
     }
 
     /// `GET /api/v1/repos/{owner}/{repo}`. A missing repository is `Ok(None)`.
     pub async fn get_repo(&self, owner: &str, name: &str) -> Result<Option<DestRepo>, ForgeError> {
         let raw = self
-            .send(
-                Method::GET,
-                ROUTE_REPO,
-                &["api", "v1", "repos", owner, name],
-                |r| r,
-            )
+            .get(ROUTE_REPO, &["api", "v1", "repos", owner, name], &[])
             .await?;
         if raw.status == StatusCode::NOT_FOUND {
             return Ok(None);
@@ -171,9 +178,7 @@ impl ForgejoClient {
     pub async fn whoami(&self) -> Result<String, ForgeError> {
         self.login
             .get_or_try_init(|| async {
-                let raw = self
-                    .send(Method::GET, ROUTE_USER, &["api", "v1", "user"], |r| r)
-                    .await?;
+                let raw = self.get(ROUTE_USER, &["api", "v1", "user"], &[]).await?;
                 let raw = ensure_success(raw, ROUTE_USER)?;
                 let user: WireUser = decode(&raw, ROUTE_USER)?;
                 if user.login.is_empty() {
@@ -212,7 +217,7 @@ impl ForgejoClient {
             (ROUTE_ORG_REPOS, vec!["api", "v1", "orgs", owner, "repos"])
         };
         let raw = self
-            .send(Method::POST, route, &segments, |r| r.json(&body))
+            .send_json(Method::POST, route, &segments, Some(&body))
             .await?;
         if raw.status == StatusCode::CONFLICT {
             return match self.get_repo(owner, name).await? {
@@ -240,11 +245,11 @@ impl ForgejoClient {
             return Ok(());
         }
         let raw = self
-            .send(
+            .send_json(
                 Method::PATCH,
                 ROUTE_REPO,
                 &["api", "v1", "repos", owner, name],
-                |r| r.json(edit),
+                Some(edit),
             )
             .await?;
         ensure_success(raw, ROUTE_REPO).map(|_| ())
@@ -253,12 +258,10 @@ impl ForgejoClient {
     /// True when the repository carries the [`MARKER_TOPIC`] topic.
     pub async fn has_marker(&self, owner: &str, name: &str) -> Result<bool, ForgeError> {
         let raw = self
-            .send_with_query(
-                Method::GET,
+            .get(
                 ROUTE_TOPICS,
                 &["api", "v1", "repos", owner, name, "topics"],
                 &[("limit", TOPICS_LIMIT)],
-                |r| r,
             )
             .await?;
         let raw = ensure_success(raw, ROUTE_TOPICS)?;
@@ -269,11 +272,11 @@ impl ForgejoClient {
     /// `PUT /api/v1/repos/{owner}/{repo}/topics/ferry-mirror`. Idempotent.
     pub async fn add_marker(&self, owner: &str, name: &str) -> Result<(), ForgeError> {
         let raw = self
-            .send(
+            .send_json(
                 Method::PUT,
                 ROUTE_TOPIC,
                 &["api", "v1", "repos", owner, name, "topics", MARKER_TOPIC],
-                |r| r,
+                None::<&()>,
             )
             .await?;
         ensure_success(raw, ROUTE_TOPIC).map(|_| ())

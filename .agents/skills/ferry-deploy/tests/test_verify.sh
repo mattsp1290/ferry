@@ -5,7 +5,7 @@ umask 077
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/ferry-verify-test.XXXXXX")
 trap 'rm -rf "$tmp"' EXIT
 mkdir -p "$tmp/bin" "$tmp/cfg/secrets" "$tmp/cfg/state"
-export FERRY_DEPLOY_CONFIG="$tmp/cfg" CFG="$tmp/cfg" CONTROL_SSH=control NAMESPACE=ferry RELEASE=ferry KUBECONFIG_PATH=/config HELM_TIMEOUT=5m NODE_SELECTOR=kubernetes.io/arch=amd64 IMAGE_PULL_REPOSITORY=localhost:5000/ferry/ferry
+export FERRY_DEPLOY_CONFIG="$tmp/cfg" CFG="$tmp/cfg" CONTROL_SSH=control NAMESPACE=ferry RELEASE=ferry KUBECONFIG_PATH=/config HELM_TIMEOUT=5m IMAGE_PULL_REPOSITORY=localhost:5000/ferry/ferry
 bash "$root/.agents/skills/ferry-deploy/scripts/deploy.sh" init >/dev/null
 printf 'obviously-fake-token\n' > "$tmp/cfg/secrets/forgejo-token"
 chmod 600 "$tmp/cfg/secrets/forgejo-token"
@@ -47,19 +47,24 @@ bash "$root/.agents/skills/ferry-deploy/scripts/cmd/verify.sh" --runtime-only > 
 jq '.config.repos=[{github:"example/source",forgejo:"example/destination"}]' "$tmp/values" > "$tmp/new-values"
 mv "$tmp/new-values" "$tmp/values"
 jq --slurpfile values "$tmp/values" '.values += $values[0]' "$tmp/good" > "$tmp/report"
-cat > "$tmp/bin/git" <<'SH'
+export FERRY_BIN="$tmp/bin/ferry"
+cat > "$tmp/bin/ferry" <<'SH'
 #!/usr/bin/env bash
-if [ "${3:-}" != ls-remote ]; then exec /usr/bin/git "$@"; fi
-case "$4" in
- https://github.com/*) printf 'abcd\trefs/heads/main\n' ;;
- *) n=$(cat "$VERIFY_TEST_ROOT/attempt"); n=$((n + 1)); printf '%s\n' "$n" > "$VERIFY_TEST_ROOT/attempt"
+[ "$1" = refs ] && [ "$2" = --config ] && [ -f "$3" ] && [ "$4" = --side ]
+case "$5" in
+ github) printf 'abcd\trefs/heads/main\n' ;;
+ forgejo) n=$(cat "$VERIFY_TEST_ROOT/attempt"); n=$((n + 1)); printf '%s\n' "$n" > "$VERIFY_TEST_ROOT/attempt"
     if [ "$n" -ge 3 ]; then printf 'abcd\trefs/heads/main\n'; else printf 'old\trefs/heads/main\n'; fi ;;
+ *) exit 1;;
 esac
 SH
 cat > "$tmp/bin/curl" <<'SH'
 #!/usr/bin/env bash
-cat > "$VERIFY_TEST_ROOT/curl-config"
-printf '%s\n' '{"topics":["ferry-mirror"]}'
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = --config ]; then shift; cat "$1" > "$VERIFY_TEST_ROOT/curl-config"; fi
+  shift
+done
+printf '%s\n200' '{"topics":["ferry-mirror"]}'
 SH
 cat > "$tmp/bin/date" <<'SH'
 #!/usr/bin/env bash
@@ -69,7 +74,7 @@ cat > "$tmp/bin/sleep" <<'SH'
 #!/usr/bin/env bash
 n=$(cat "$VERIFY_TEST_ROOT/time"); printf '%s\n' "$((n + $1))" > "$VERIFY_TEST_ROOT/time"
 SH
-chmod +x "$tmp/bin/git" "$tmp/bin/curl" "$tmp/bin/date" "$tmp/bin/sleep"
+chmod +x "$tmp/bin/ferry" "$tmp/bin/curl" "$tmp/bin/date" "$tmp/bin/sleep"
 printf '0\n' > "$tmp/attempt"
 printf '100\n' > "$tmp/time"
 bash "$root/.agents/skills/ferry-deploy/scripts/cmd/verify.sh" --wait > "$tmp/output" 2> "$tmp/errors" || { cat "$tmp/output" "$tmp/errors"; exit 1; }
@@ -97,7 +102,7 @@ cat > "$tmp/bin/kubectl" <<'SH'
 #!/usr/bin/env bash
 case " $* " in
  *' get nodes '*)
-    # Verification must use the deployed selector locally, not NODE_SELECTOR.
+    # Verification must use the full deployed selector locally.
     case " $* " in *' -l '*) exit 1 ;; esac
     jq '.nodes' "$VERIFY_TEST_ROOT/good" ;;
  *' get pods '*)
@@ -121,7 +126,6 @@ bash -c "$last"
 SH
 chmod +x "$tmp/bin/kubectl"
 printf 'recent healthy log without startup\n' > "$tmp/recent-logs"
-NODE_SELECTOR=local.setting=stale bash "$root/.agents/skills/ferry-deploy/scripts/cmd/verify.sh" --runtime-only > "$tmp/output"
 printf 'dogstatsd send failed\n' > "$tmp/recent-logs"
 if bash "$root/.agents/skills/ferry-deploy/scripts/cmd/verify.sh" --runtime-only > "$tmp/output"; then exit 1; fi
 grep -q 'FAIL: dogstatsd sends in last 15 minutes' "$tmp/output"

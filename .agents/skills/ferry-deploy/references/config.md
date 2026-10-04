@@ -39,7 +39,6 @@ Plain `KEY=value` lines, `#` comments, blank lines. The loader parses the file l
 | `IMAGE_PULL_REPOSITORY` | yes | Repository reference the node's runtime pulls. | `[A-Za-z0-9.-]+(:[0-9]+)?(/[a-z0-9._-]+)+` | `localhost:5000/ferry/ferry` |
 | `IMAGE_PUSH_PATH` | no | Repository path under `REGISTRY_PUSH`. Default `ferry/ferry`. | `[a-z0-9._-]+(/[a-z0-9._-]+)*` | |
 | `BASE_PUSH_PATH` | no | Default `ferry/base`. | same | |
-| `NODE_SELECTOR` | no | Legacy informational hint; pod selection uses the full Helm `nodeSelector` value. Set node labels in `values.yaml`. | `[A-Za-z0-9./_-]+=[A-Za-z0-9._-]+` | |
 | `HELM_TIMEOUT` | no | Default `5m`. | `[0-9]+[smh]` | |
 
 GitOps keys and state directories are unsupported until the GitOps phase is implemented.
@@ -80,10 +79,10 @@ The helper chart emits JSON and Helm merges YAML; both flow and block YAML work.
 - `deploy init` creates `$CFG` with the layout above and the right modes, copies the two example files into place, and prints the paths the owner must edit. It never overwrites an existing file. It creates no token file.
 - `deploy check` runs the validation rules, then the tool checks, the control-host checks, `merged_values`, and the `ferry check-config` render check. Flags `--forgejo` and `--github` add the token checks. Without a flag it does not open a token file.
 - The ferry binary for `check-config` and for askpass is `$FERRY_BIN` when set, otherwise `target/debug/ferry` after a `cargo build --locked` that `check` runs itself.
-- Token reading: one helper, `with_token_fd <path> <fd> <command…>`, opens the file on a file descriptor for the child. No shell function returns a token as a string and no shell variable holds one, and no token is exported into an environment. This is what makes success criterion 3 checkable.
+- Token reading: one helper, `with_token_fd <path> <fd> <command…>` (descriptor 3 for Forgejo, 4 for optional GitHub), opens the file on a file descriptor for the child. No shell function returns a token as a string and no shell variable holds one, and no token is exported into an environment. This is what makes success criterion 3 checkable.
 - Output: the skill prints setting names and non-secret values. It never prints the allowlist unless the operator passes `--show-values`.
 - `state/deployments.jsonl` is append-only and is a log, not a source of truth.
 
-Secret production validates both descriptor inputs as UTF-8, strips trailing Unicode whitespace, and rejects an empty required token or embedded CR, LF or NUL. An empty optional GitHub token is omitted. The entire manifest is produced in memory before SSH starts; a malformed token causes no remote call. Tokens and their base64 form never become shell variables, arguments, environment values, or temporary files. API requests disable curl startup configuration, require HTTPS, and have connection and total timeouts.
+The shared `credentials.py` reader validates both descriptor inputs as UTF-8, strips trailing Unicode whitespace, and rejects an empty required token or embedded CR, LF or NUL. An empty optional GitHub token is omitted. The entire manifest is produced in memory before SSH starts; a malformed token causes no remote call. Tokens and their base64 form never become shell variables, arguments, environment values, or temporary files. API requests disable curl startup configuration, require HTTPS, and have connection and total timeouts.
 
 The chart probes port 8080. Ferry uses its default `health.listen` address `0.0.0.0:8080`; `check` refuses a values override with a different port. The local acceptance tests additionally require `rg` (ripgrep).

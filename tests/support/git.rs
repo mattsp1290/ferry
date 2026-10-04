@@ -56,10 +56,14 @@ pub fn git_settings(
         timeout,
         kill_grace: Duration::from_millis(500),
         token_files: TokenFiles::default(),
-        github_host: "github.invalid".to_string(),
-        github_scheme: "http".into(),
-        forgejo_host: "forgejo.invalid".to_string(),
-        forgejo_scheme: "http".into(),
+        github: ferry::git::askpass::Origin {
+            host: "github.invalid".to_string(),
+            scheme: "http".into(),
+        },
+        forgejo: ferry::git::askpass::Origin {
+            host: "forgejo.invalid".to_string(),
+            scheme: "http".into(),
+        },
         forgejo_user: FORGEJO_LOGIN.to_string(),
         secrets: vec![Token::new(FORGEJO_TOKEN)],
         askpass_path: PathBuf::from(env!("CARGO_BIN_EXE_ferry")),

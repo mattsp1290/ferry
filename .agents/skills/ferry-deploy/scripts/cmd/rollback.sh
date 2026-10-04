@@ -2,6 +2,7 @@
 set -euo pipefail
 source "$(cd "$(dirname "$0")/../lib" && pwd)/config.sh"
 source "$SKILL_DIR/scripts/lib/remote.sh"
+source "$SKILL_DIR/scripts/lib/state.sh"
 revision=''
 case "$#" in
     0) ;;
@@ -34,5 +35,8 @@ report=$(remote_run rollback "REVISION=$selected" "EXPECTED_REVISION=$expected_r
 result=success
 bash "$SKILL_DIR/scripts/cmd/verify.sh" --runtime-only || result=failed
 umask 077
-printf '%s' "$report" | jq -c --arg time "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg result "$result" '{revision:.status.version,commit:.values.image.version,digest:.values.image.digest,time:$time,action:"rollback",result:$result}' >> "$CFG/state/deployments.jsonl"
+version=$(printf '%s' "$report" | jq -r '.values.image.version')
+digest=$(printf '%s' "$report" | jq -r '.values.image.digest')
+revision=$(printf '%s' "$report" | jq -r '.status.version')
+log_deployment rollback "$result" "$revision"
 [ "$result" = success ]

@@ -27,7 +27,23 @@ use crate::scheduler::Syncer;
 use crate::telemetry;
 use crate::util::lock;
 
-pub use outcome::{ErrorKind, SyncOutcome, SyncResult};
+pub use outcome::{ErrorKind, SyncOutcome, SyncStatus};
+
+/// The same source and destination URLs used by the sync engine. This only
+/// derives remote addresses; it never contacts or writes to either forge.
+pub fn remote_for(config: &Config, entry: &RepoEntry, side: Side) -> Remote {
+    match side {
+        Side::Github => repo_remote(&config.github.git_url, entry.github_parts(), side),
+        Side::Forgejo => repo_remote(&config.forgejo.url, entry.forgejo_parts(), side),
+    }
+}
+
+fn repo_remote(base: &str, (owner, name): (&str, &str), side: Side) -> Remote {
+    Remote {
+        url: format!("{}/{owner}/{name}.git", base.trim_end_matches('/')),
+        side,
+    }
+}
 
 /// Everything one sync pass needs. Shared by all entries.
 pub struct SyncContext {
@@ -85,20 +101,12 @@ impl SyncContext {
             .join(format!("{name}.git"))
     }
 
-    fn source_remote(&self, entry: &RepoEntry) -> Remote {
-        let (owner, name) = entry.github_parts();
-        Remote {
-            url: format!("{}/{owner}/{name}.git", self.github_git_url),
-            side: Side::Github,
-        }
+    pub fn source_remote(&self, entry: &RepoEntry) -> Remote {
+        repo_remote(&self.github_git_url, entry.github_parts(), Side::Github)
     }
 
-    fn dest_remote(&self, entry: &RepoEntry) -> Remote {
-        let (owner, name) = entry.forgejo_parts();
-        Remote {
-            url: format!("{}/{owner}/{name}.git", self.forgejo_url),
-            side: Side::Forgejo,
-        }
+    pub fn dest_remote(&self, entry: &RepoEntry) -> Remote {
+        repo_remote(&self.forgejo_url, entry.forgejo_parts(), Side::Forgejo)
     }
 
     /// Whether the GitHub REST metadata is due, and if so, records the
@@ -230,23 +238,6 @@ impl Failure {
     }
 }
 
-/// What a successful pass did.
-struct Done {
-    result: SyncResult,
-    refs_changed: u32,
-    refs_pruned: u32,
-}
-
-impl Done {
-    fn unchanged(result: SyncResult) -> Self {
-        Self {
-            result,
-            refs_changed: 0,
-            refs_pruned: 0,
-        }
-    }
-}
-
 /// Runs one pass for one entry inside a `ferry.sync_repo` root span and logs
 /// one line with the result.
 pub async fn sync_repo(ctx: &SyncContext, entry: &RepoEntry) -> SyncOutcome {
@@ -267,45 +258,50 @@ pub async fn sync_repo(ctx: &SyncContext, entry: &RepoEntry) -> SyncOutcome {
 
         let span = tracing::Span::current();
         let outcome = match finished {
-            Ok(done) => SyncOutcome::success(done.result, duration)
-                .with_refs(done.refs_changed, done.refs_pruned),
+            Ok(status) => SyncOutcome { status, duration },
             Err(failure) => {
                 if failure.cancelled {
                     tracing::info!(duration_ms, "sync cancelled by shutdown");
                 } else {
                     telemetry::tracing::mark_error(&span, failure.kind.as_str());
                     tracing::error!(
-                        result = SyncResult::Error.as_str(),
+                        result = "error",
                         error_kind = failure.kind.as_str(),
                         duration_ms,
                         detail = %failure.detail,
                         "sync failed"
                     );
                 }
-                SyncOutcome::error(failure.kind, duration).with_retry_after(failure.retry_after)
+                SyncOutcome {
+                    status: SyncStatus::Failed {
+                        kind: failure.kind,
+                        retry_after: failure.retry_after,
+                    },
+                    duration,
+                }
             }
         };
 
-        span.record("result", outcome.result.as_str());
+        span.record("result", outcome.result_tag());
         span.record("error_kind", outcome.error_kind_tag());
-        span.record("refs_changed", outcome.refs_changed);
-        match outcome.result {
-            SyncResult::Error => {}
+        span.record("refs_changed", outcome.refs().0);
+        match outcome.status {
+            SyncStatus::Failed { .. } => {}
             // Most passes change nothing. Logging them at info would bury
             // the lines that matter.
-            SyncResult::Noop => tracing::debug!(
-                result = outcome.result.as_str(),
+            SyncStatus::Noop => tracing::debug!(
+                result = outcome.result_tag(),
                 error_kind = outcome.error_kind_tag(),
                 duration_ms,
-                refs_changed = outcome.refs_changed,
+                refs_changed = outcome.refs().0,
                 "sync finished"
             ),
-            SyncResult::Synced | SyncResult::Empty => tracing::info!(
-                result = outcome.result.as_str(),
+            SyncStatus::Synced { .. } | SyncStatus::Empty => tracing::info!(
+                result = outcome.result_tag(),
                 error_kind = outcome.error_kind_tag(),
                 duration_ms,
-                refs_changed = outcome.refs_changed,
-                refs_pruned = outcome.refs_pruned,
+                refs_changed = outcome.refs().0,
+                refs_pruned = outcome.refs().1,
                 "sync finished"
             ),
         }
@@ -322,7 +318,7 @@ struct Dest<'a> {
     remote: &'a Remote,
 }
 
-async fn run(ctx: &SyncContext, entry: &RepoEntry) -> Result<Done, Failure> {
+async fn run(ctx: &SyncContext, entry: &RepoEntry) -> Result<SyncStatus, Failure> {
     let (owner, name) = entry.forgejo_parts();
     let source = ctx.source_remote(entry);
     let dest_remote = ctx.dest_remote(entry);
@@ -350,7 +346,7 @@ async fn run(ctx: &SyncContext, entry: &RepoEntry) -> Result<Done, Failure> {
 
     if !src.refs.has_heads() {
         return if dst.refs.is_empty() {
-            Ok(Done::unchanged(SyncResult::Empty))
+            Ok(SyncStatus::Empty)
         } else {
             // Never prune a populated mirror because GitHub reports zero
             // branches: that is far more likely a fault than an intent.
@@ -376,7 +372,7 @@ async fn run(ctx: &SyncContext, entry: &RepoEntry) -> Result<Done, Failure> {
             &dst.refs,
         )
         .await?;
-        return Ok(Done::unchanged(SyncResult::Noop));
+        return Ok(SyncStatus::Noop);
     }
 
     ctx.git.ensure_cache(&cache).await.map_err(Failure::cache)?;
@@ -450,8 +446,7 @@ async fn run(ctx: &SyncContext, entry: &RepoEntry) -> Result<Done, Failure> {
             })?;
     }
 
-    Ok(Done {
-        result: SyncResult::Synced,
+    Ok(SyncStatus::Synced {
         refs_changed: count(dst.refs.diff_count(&local)),
         refs_pruned,
     })

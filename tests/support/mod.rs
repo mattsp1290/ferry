@@ -32,11 +32,30 @@ use ferry::config::{
 };
 use ferry::forge::{ForgejoClient, GithubClient, http_client};
 use ferry::git::{Git, RefMap, Remote};
-use ferry::sync::{ErrorKind, SyncContext, SyncOutcome, SyncResult};
+use ferry::sync::{ErrorKind, SyncContext, SyncOutcome, SyncStatus};
 use tempfile::TempDir;
 use tokio_util::sync::CancellationToken;
 use wiremock::matchers::any;
 use wiremock::{Mock, MockServer};
+
+pub fn base64(input: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    for chunk in input.chunks(3) {
+        let n = chunk
+            .iter()
+            .enumerate()
+            .fold(0u32, |acc, (i, b)| acc | (u32::from(*b) << (16 - 8 * i)));
+        for i in 0..4 {
+            if i <= chunk.len() {
+                out.push(ALPHABET[((n >> (18 - 6 * i)) & 63) as usize] as char);
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
+}
 
 /// Obviously fake. Tests assert it never shows up in telemetry.
 pub const FORGEJO_TOKEN: &str = "test-forgejo-token-not-real";
@@ -48,14 +67,30 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+/// The binary with all inherited Ferry and Datadog settings removed.
+pub fn ferry_command() -> std::process::Command {
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_ferry"));
+    for (name, _) in std::env::vars_os() {
+        let name_text = name.to_string_lossy();
+        if name_text.starts_with("FERRY_") || name_text.starts_with("DD_") {
+            command.env_remove(name);
+        }
+    }
+    command
+}
+
 pub fn assert_synced(outcome: &SyncOutcome) {
-    assert_eq!(outcome.result, SyncResult::Synced, "{outcome:?}");
-    assert_eq!(outcome.error_kind, None, "{outcome:?}");
+    assert!(
+        matches!(outcome.status, SyncStatus::Synced { .. }),
+        "{outcome:?}"
+    );
 }
 
 pub fn assert_error(outcome: &SyncOutcome, kind: ErrorKind) {
-    assert_eq!(outcome.result, SyncResult::Error, "{outcome:?}");
-    assert_eq!(outcome.error_kind, Some(kind), "{outcome:?}");
+    assert!(
+        matches!(outcome.status, SyncStatus::Failed { kind: actual, .. } if actual == kind),
+        "{outcome:?}"
+    );
 }
 
 /// Case 21 applies to every test: ferry never sends a DELETE request.
@@ -330,13 +365,7 @@ impl World {
 
     /// The cache repository ferry uses for `entry`.
     pub fn cache_path(&self, entry: &RepoEntry) -> PathBuf {
-        let (owner, name) = entry.github_parts();
-        self.config
-            .sync
-            .cache_dir
-            .join("repos")
-            .join(owner)
-            .join(format!("{name}.git"))
+        self.context().cache_path(entry)
     }
 
     /// Requests the fake servers received with the given HTTP method.
@@ -352,5 +381,17 @@ impl World {
                 .count();
         }
         count
+    }
+}
+
+#[cfg(test)]
+mod encoding_tests {
+    use super::base64;
+    #[test]
+    fn base64_helper_matches_known_vectors() {
+        assert_eq!(base64(b"f"), "Zg==");
+        assert_eq!(base64(b"fo"), "Zm8=");
+        assert_eq!(base64(b"foo"), "Zm9v");
+        assert_eq!(base64(b"ferry:x"), "ZmVycnk6eA==");
     }
 }

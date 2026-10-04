@@ -67,15 +67,8 @@ config:
       adopt: true
 YAML
 
-if [ -n "${FERRY_BIN:-}" ]; then
-  ferry_bin=$FERRY_BIN
-elif [ -x target/debug/ferry ]; then
-  ferry_bin=target/debug/ferry
-elif [ -x target/release/ferry ]; then
-  ferry_bin=target/release/ferry
-else
-  ferry_bin=
-fi
+source scripts/lib/ferry-binary.sh
+ferry_bin=$(ferry_binary existing) || ferry_bin=
 
 command -v helm >/dev/null || { echo "FAIL: helm is required"; exit 1; }
 
@@ -97,6 +90,7 @@ for transport in socket service none; do
     continue
   fi
   ok "$label helm template"
+  check_not "$label default chart omits preflight resources" grep -q ferry-deploy-preflight "$out"
 
   check "$label one replica" grep -qx '  replicas: 1' "$out"
   check "$label strategy Recreate" grep -qx '    type: Recreate' "$out"

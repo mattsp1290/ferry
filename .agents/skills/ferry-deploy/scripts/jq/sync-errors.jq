@@ -1,0 +1,1 @@
+.logs | split("\n")[] | fromjson? | select(.message == "sync failed" or .fields.message == "sync failed") | [(.repo // .fields.repo // "unknown"), (.error_kind // .fields.error_kind // "unknown")] | @tsv

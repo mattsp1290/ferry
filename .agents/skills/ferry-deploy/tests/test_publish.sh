@@ -6,6 +6,8 @@ work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 mkdir -p "$work/repo/.agents/skills" "$work/repo/docker" "$work/bin" "$work/home"
 cp -R "$skill" "$work/repo/.agents/skills/ferry-deploy"
+mkdir -p "$work/repo/scripts/lib"
+cp "$skill/../../../scripts/lib/ferry-binary.sh" "$work/repo/scripts/lib/"
 printf 'FROM scratch\n' > "$work/repo/docker/base.Dockerfile"
 git -C "$work/repo" init -q
 git -C "$work/repo" add .

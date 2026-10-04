@@ -15,12 +15,15 @@ fn main() -> ExitCode {
     }
 
     let code = match Cli::parse().command {
+        Command::Refs { config, side, repo } => {
+            app::refs(&resolve_config_path(config), side.into(), &repo)
+        }
         Command::Run { config } => app::run(&resolve_config_path(config)),
         Command::Sync { config, repos, .. } => app::sync_once(&resolve_config_path(config), &repos),
         Command::CheckConfig { config } => {
             let path = resolve_config_path(config);
             match app::load_config(&path) {
-                Ok(config) => {
+                Some(config) => {
                     println!(
                         "config ok: {} ({} repos)",
                         path.display(),
@@ -28,7 +31,7 @@ fn main() -> ExitCode {
                     );
                     exit::SUCCESS
                 }
-                Err(code) => code,
+                None => exit::CONFIG,
             }
         }
     };

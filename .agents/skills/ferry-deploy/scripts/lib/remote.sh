@@ -4,9 +4,9 @@ remote_command() {
   local name=$1 encoded command setting extra
   shift
   case "$name" in *[!a-z-]*|'') config_error 'invalid remote script name';; esac
-  encoded=$(base64 < "$SKILL_DIR/scripts/remote/$name.sh" | tr -d '\r\n')
+  encoded=$(cat "$SKILL_DIR/scripts/remote/lib.sh" "$SKILL_DIR/scripts/remote/$name.sh" | base64 | tr -d '\r\n')
   command='env'
-  for setting in KUBECONFIG_PATH NAMESPACE RELEASE HELM_TIMEOUT NODE_SELECTOR IMAGE_PULL_REPOSITORY; do
+  for setting in KUBECONFIG_PATH NAMESPACE RELEASE HELM_TIMEOUT; do
     command="$command $setting=${!setting}"
   done
   for extra in "$@"; do

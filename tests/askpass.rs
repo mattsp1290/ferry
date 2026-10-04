@@ -13,10 +13,7 @@ use tokio_util::sync::CancellationToken;
 
 mod support;
 
-use support::{git_settings, stdout, write_script};
-
-const GITHUB_TOKEN: &str = "github-token-not-real";
-const FORGEJO_TOKEN: &str = "test-token-not-real";
+use support::{FORGEJO_TOKEN, GITHUB_TOKEN, base64, git_settings, stdout, write_script};
 
 struct Env {
     _tmp: tempfile::TempDir,
@@ -135,25 +132,6 @@ fn no_prompt_argument_exits_one() {
 
 // ------------------------------------------------------------ real git
 
-fn base64(input: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::new();
-    for chunk in input.chunks(3) {
-        let n = chunk
-            .iter()
-            .enumerate()
-            .fold(0u32, |acc, (i, b)| acc | (u32::from(*b) << (16 - 8 * i)));
-        for i in 0..4 {
-            if i <= chunk.len() {
-                out.push(ALPHABET[((n >> (18 - 6 * i)) & 63) as usize] as char);
-            } else {
-                out.push('=');
-            }
-        }
-    }
-    out
-}
-
 /// Answers every request with `401` and `WWW-Authenticate: Basic`, recording
 /// each `Authorization` header it sees.
 async fn spawn_401_server() -> (u16, Arc<Mutex<Vec<String>>>) {
@@ -204,15 +182,21 @@ fn runner_for(port: u16, github_side: bool, env: &Env, secrets: Vec<Token>) -> G
             github: Some(env.github_file.clone()),
             forgejo: Some(env.forgejo_file.clone()),
         },
-        github_host: if github_side {
-            host.clone()
-        } else {
-            "github.com".into()
+        github: ferry::git::askpass::Origin {
+            scheme: "http".into(),
+            host: if github_side {
+                host.clone()
+            } else {
+                "github.com".into()
+            },
         },
-        forgejo_host: if github_side {
-            "forge.invalid".into()
-        } else {
-            host
+        forgejo: ferry::git::askpass::Origin {
+            scheme: "http".into(),
+            host: if github_side {
+                "forge.invalid".into()
+            } else {
+                host
+            },
         },
         secrets,
         ..git_settings(
@@ -260,14 +244,6 @@ async fn real_git_gets_forgejo_credentials_through_askpass() {
 #[tokio::test]
 async fn real_git_gets_github_credentials_through_askpass() {
     real_git_sends_credentials(true, "x-access-token", GITHUB_TOKEN).await;
-}
-
-#[test]
-fn base64_helper_matches_known_vectors() {
-    assert_eq!(base64(b"f"), "Zg==");
-    assert_eq!(base64(b"fo"), "Zm8=");
-    assert_eq!(base64(b"foo"), "Zm9v");
-    assert_eq!(base64(b"ferry:x"), "ZmVycnk6eA==");
 }
 
 // ----------------------------------------------------------- redaction

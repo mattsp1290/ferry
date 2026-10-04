@@ -33,7 +33,7 @@ assert not leaked(), 'Token leakage: '+str(leaked())
 assert not list((root/'remote').iterdir()), 'Remote temporary files remained'
 records=[json.loads(path.read_text()) for path in (root/'records').glob('*.json')]
 assert any(r['tool']=='ssh' and 'bash' in r['argv'][-1] for r in records), 'SSH stub did not execute remote scripts'
-assert any(r['tool']=='git' and 'ls-remote' in r['argv'] for r in records), 'Verification did not check parity'
+assert any(r['tool']=='ferry' and 'refs' in r['argv'] for r in records), 'Verification did not check parity through Ferry'
 assert any(r['tool']=='build' for r in records) and any(r['tool']=='assemble' for r in records), 'Publish did not build and assemble'
 assert any(r['tool']=='curl' for r in records), 'Token checks did not invoke curl'
 # Demonstrate both prohibited channels fail the same scanner, then restore.
@@ -48,7 +48,7 @@ for path in set((root/'records').glob('*'))-before: path.unlink()
 assert not leaked()
 for path in (skill/'scripts').rglob('*.sh'):
     for expression in re.finditer(r'\$\([^)]*\)|<<<[^\n]*',path.read_text()):
-        if re.search(r'(?:secrets/|state/gitops/)',expression.group()):
+        if re.search(r'secrets/',expression.group()):
             raise AssertionError('Token file command substitution/here-string: '+str(path))
 print('ok: full deployment sequence keeps tokens off argv, environment, output and disk; argv/env mutations detected')
 PY

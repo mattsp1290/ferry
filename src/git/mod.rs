@@ -62,11 +62,6 @@ pub struct Remote {
     pub side: Side,
 }
 
-/// The host and port of a remote URL, for the askpass host variables.
-pub fn host_of(url: &str) -> Option<String> {
-    askpass::host_port(url)
-}
-
 /// Everything a `GitRunner` needs. Plain data: the runner reads no global
 /// environment except `PATH`.
 #[derive(Debug, Clone)]
@@ -77,12 +72,8 @@ pub struct GitSettings {
     /// Wait between SIGTERM and SIGKILL.
     pub kill_grace: Duration,
     pub token_files: TokenFiles,
-    /// `host[:port]` that askpass answers with the GitHub token.
-    pub github_host: String,
-    pub github_scheme: String,
-    /// `host[:port]` that askpass answers with the Forgejo token.
-    pub forgejo_host: String,
-    pub forgejo_scheme: String,
+    pub github: askpass::Origin,
+    pub forgejo: askpass::Origin,
     pub forgejo_user: String,
     /// Secret values to strip from stderr.
     pub secrets: Vec<Token>,
@@ -102,10 +93,10 @@ impl GitSettings {
         tokens: &Tokens,
         cancel: CancellationToken,
     ) -> std::io::Result<Self> {
-        let invalid = |what: &str, url: &str| {
+        let invalid = |what: &str| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
-                format!("{what} has no host: {url}"),
+                format!("{what} has no valid origin"),
             )
         };
         Ok(Self {
@@ -113,18 +104,10 @@ impl GitSettings {
             timeout: config.sync.git_timeout(),
             kill_grace: DEFAULT_KILL_GRACE,
             token_files: token_files.clone(),
-            github_host: host_of(&config.github.git_url)
-                .ok_or_else(|| invalid("github.git_url", &config.github.git_url))?,
-            forgejo_host: host_of(&config.forgejo.url)
-                .ok_or_else(|| invalid("forgejo.url", &config.forgejo.url))?,
-            github_scheme: url::Url::parse(&config.github.git_url)
-                .map_err(|_| invalid("github.git_url", ""))?
-                .scheme()
-                .to_owned(),
-            forgejo_scheme: url::Url::parse(&config.forgejo.url)
-                .map_err(|_| invalid("forgejo.url", ""))?
-                .scheme()
-                .to_owned(),
+            github: askpass::Origin::parse(&config.github.git_url)
+                .ok_or_else(|| invalid("github.git_url"))?,
+            forgejo: askpass::Origin::parse(&config.forgejo.url)
+                .ok_or_else(|| invalid("forgejo.url"))?,
             forgejo_user: config.forgejo.username.clone(),
             secrets: tokens.secrets(),
             askpass_path: std::env::current_exe()?,
@@ -170,16 +153,6 @@ macro_rules! git_span {
 impl GitRunner {
     pub fn new(settings: GitSettings) -> Self {
         Self { settings }
-    }
-
-    /// See [`GitSettings::from_config`].
-    pub fn from_config(
-        config: &Config,
-        token_files: &TokenFiles,
-        tokens: &Tokens,
-        cancel: CancellationToken,
-    ) -> std::io::Result<Self> {
-        GitSettings::from_config(config, token_files, tokens, cancel).map(Self::new)
     }
 
     /// Overrides the askpass executable. Integration tests pass
@@ -287,10 +260,10 @@ impl GitRunner {
             ("GIT_CONFIG_GLOBAL", "/dev/null".into()),
             ("HOME", s.cache_dir.join(".home").into_os_string()),
             (askpass::ASKPASS_ENV, "1".into()),
-            (askpass::GITHUB_HOST_ENV, s.github_host.clone().into()),
-            (askpass::GITHUB_SCHEME_ENV, s.github_scheme.clone().into()),
-            (askpass::FORGEJO_HOST_ENV, s.forgejo_host.clone().into()),
-            (askpass::FORGEJO_SCHEME_ENV, s.forgejo_scheme.clone().into()),
+            (askpass::GITHUB_HOST_ENV, s.github.host.clone().into()),
+            (askpass::GITHUB_SCHEME_ENV, s.github.scheme.clone().into()),
+            (askpass::FORGEJO_HOST_ENV, s.forgejo.host.clone().into()),
+            (askpass::FORGEJO_SCHEME_ENV, s.forgejo.scheme.clone().into()),
             (askpass::FORGEJO_USER_ENV, s.forgejo_user.clone().into()),
             (
                 "PATH",

@@ -8,7 +8,7 @@ mod support;
 use std::sync::atomic::Ordering;
 
 use ferry::sync::marker::MARKER_FILE;
-use ferry::sync::{ErrorKind, SyncResult, sync_repo};
+use ferry::sync::{ErrorKind, sync_repo};
 use support::{FakeRepo, GithubAnswer, World, assert_error, assert_no_delete, assert_synced};
 
 fn git_writes(world: &World) -> usize {
@@ -26,8 +26,8 @@ async fn case_01_missing_destination_is_created_private_marked_and_synced() {
     let outcome = sync_repo(&ctx, &entry).await;
 
     assert_synced(&outcome);
-    assert_eq!(outcome.refs_changed, 2);
-    assert_eq!(outcome.refs_pruned, 0);
+    assert_eq!(outcome.refs().0, 2);
+    assert_eq!(outcome.refs().1, 0);
     assert_eq!(world.dest_refs(&entry), source.refs());
     let dest = world.dest(&entry).expect("destination created");
     assert!(dest.private);
@@ -92,8 +92,8 @@ async fn case_03_no_change_is_a_noop_without_fetch_or_push() {
 
     let outcome = sync_repo(&ctx, &entry).await;
 
-    assert_eq!(outcome.result, SyncResult::Noop, "{outcome:?}");
-    assert_eq!(outcome.refs_changed, 0);
+    assert_eq!(outcome.result_tag(), "noop", "{outcome:?}");
+    assert_eq!(outcome.refs().0, 0);
     assert_eq!(world.events.count("git:fetch"), 0);
     assert_eq!(git_writes(&world), 0);
     assert_eq!(world.events.count("forgejo:PATCH"), 0);
@@ -114,8 +114,8 @@ async fn case_04_new_commit_and_new_tag_are_synced() {
     let outcome = sync_repo(&ctx, &entry).await;
 
     assert_synced(&outcome);
-    assert_eq!(outcome.refs_changed, 2);
-    assert_eq!(outcome.refs_pruned, 0);
+    assert_eq!(outcome.refs().0, 2);
+    assert_eq!(outcome.refs().1, 0);
     assert_eq!(world.dest_refs(&entry), source.refs());
     assert_eq!(world.events.count("git:push --prune"), 0);
     assert_no_delete(&world).await;
@@ -135,7 +135,7 @@ async fn case_05_source_force_push_overwrites_the_destination() {
     let outcome = sync_repo(&ctx, &entry).await;
 
     assert_synced(&outcome);
-    assert_eq!(outcome.refs_changed, 1);
+    assert_eq!(outcome.refs().0, 1);
     let after = world.dest_refs(&entry);
     assert_ne!(after, before);
     assert_eq!(after.get("refs/heads/main"), Some(rewritten.as_str()));
@@ -157,14 +157,14 @@ async fn case_06_deleted_source_branch_and_tag_are_pruned() {
     source.delete_branch("feature");
     let outcome = sync_repo(&ctx, &entry).await;
     assert_synced(&outcome);
-    assert_eq!(outcome.refs_pruned, 1);
-    assert_eq!(outcome.refs_changed, 1);
+    assert_eq!(outcome.refs().1, 1);
+    assert_eq!(outcome.refs().0, 1);
     assert_eq!(world.dest_refs(&entry), source.refs());
 
     source.delete_tag("v1");
     let outcome = sync_repo(&ctx, &entry).await;
     assert_synced(&outcome);
-    assert_eq!(outcome.refs_pruned, 1);
+    assert_eq!(outcome.refs().1, 1);
     assert_eq!(world.dest_refs(&entry), source.refs());
     assert_eq!(world.dest_refs(&entry).len(), 1);
     assert_no_delete(&world).await;
@@ -186,7 +186,7 @@ async fn case_07_default_branch_rename_switches_the_default_before_pruning() {
     // The fake Forgejo refuses to delete its default branch, as the real one
     // does, so a wrong order fails the prune push.
     assert_synced(&outcome);
-    assert_eq!(outcome.refs_pruned, 1);
+    assert_eq!(outcome.refs().1, 1);
     assert_eq!(world.dest_refs(&entry), source.refs());
     assert_eq!(world.dest(&entry).expect("dest").default_branch, "trunk");
 
@@ -238,12 +238,12 @@ async fn case_08b_empty_source_and_empty_destination_is_empty() {
     let ctx = world.context();
 
     let outcome = sync_repo(&ctx, &entry).await;
-    assert_eq!(outcome.result, SyncResult::Empty, "{outcome:?}");
+    assert_eq!(outcome.result_tag(), "empty", "{outcome:?}");
     assert!(world.dest(&entry).expect("created").has_marker());
     assert_eq!(git_writes(&world), 0);
 
     let outcome = sync_repo(&ctx, &entry).await;
-    assert_eq!(outcome.result, SyncResult::Empty, "{outcome:?}");
+    assert_eq!(outcome.result_tag(), "empty", "{outcome:?}");
     assert_no_delete(&world).await;
 }
 
@@ -354,7 +354,7 @@ async fn case_13_adopt_marks_and_overwrites_an_unmarked_destination() {
     let outcome = sync_repo(&ctx, &entry).await;
 
     assert_synced(&outcome);
-    assert_eq!(outcome.refs_pruned, 1);
+    assert_eq!(outcome.refs().1, 1);
     assert_eq!(world.dest_refs(&entry), source.refs());
     let dest = world.dest(&entry).expect("dest");
     assert!(dest.has_marker());
@@ -405,7 +405,7 @@ async fn case_15_missing_lfs_marker_runs_the_lfs_steps_once() {
     let outcome = sync_repo(&ctx, &entry).await;
 
     assert_synced(&outcome);
-    assert_eq!(outcome.refs_changed, 0);
+    assert_eq!(outcome.refs().0, 0);
     assert_eq!(world.events.count("git:lfs_fetch"), 1);
     assert_eq!(world.events.count("git:lfs_push"), 1);
     assert_eq!(
@@ -415,7 +415,7 @@ async fn case_15_missing_lfs_marker_runs_the_lfs_steps_once() {
 
     world.events.clear();
     let outcome = sync_repo(&ctx, &entry).await;
-    assert_eq!(outcome.result, SyncResult::Noop, "{outcome:?}");
+    assert_eq!(outcome.result_tag(), "noop", "{outcome:?}");
     assert_eq!(world.events.count("git:lfs_fetch"), 0);
     assert_no_delete(&world).await;
 }
@@ -463,7 +463,7 @@ async fn case_16b_description_follows_github_on_the_metadata_interval() {
     );
     let outcome = sync_repo(&ctx, &entry).await;
 
-    assert_eq!(outcome.result, SyncResult::Noop, "{outcome:?}");
+    assert_eq!(outcome.result_tag(), "noop", "{outcome:?}");
     assert_eq!(world.dest(&entry).expect("dest").description, "changed");
     assert_no_delete(&world).await;
 }
@@ -477,7 +477,7 @@ async fn case_16c_github_rest_is_asked_at_most_once_per_metadata_interval() {
     assert_synced(&sync_repo(&ctx, &entry).await);
     source.commit("README.md", "second\n");
     assert_synced(&sync_repo(&ctx, &entry).await);
-    assert_eq!(sync_repo(&ctx, &entry).await.result, SyncResult::Noop);
+    assert_eq!(sync_repo(&ctx, &entry).await.result_tag(), "noop");
 
     assert_eq!(world.events.count("github:GET"), 1);
     assert_no_delete(&world).await;
@@ -505,7 +505,7 @@ async fn case_17_forgejo_edit_failure_with_equal_refs_is_a_metadata_error() {
 
     world.state().edit_status = None;
     let outcome = sync_repo(&ctx, &entry).await;
-    assert_eq!(outcome.result, SyncResult::Noop, "{outcome:?}");
+    assert_eq!(outcome.result_tag(), "noop", "{outcome:?}");
     assert_eq!(world.dest(&entry).expect("dest").default_branch, "main");
     assert_no_delete(&world).await;
 }
@@ -584,7 +584,7 @@ async fn case_23_failed_provisioning_still_ends_with_actions_disabled() {
     // The repository is created, then the Actions edit fails.
     world.state().edit_status = Some(500);
     let outcome = sync_repo(&ctx, &entry).await;
-    assert_eq!(outcome.result, SyncResult::Error, "{outcome:?}");
+    assert_eq!(outcome.result_tag(), "error", "{outcome:?}");
     let dest = world.dest(&entry).expect("created");
     assert!(
         dest.has_actions,

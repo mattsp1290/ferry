@@ -14,7 +14,7 @@ use ferry::config::RepoEntry;
 use ferry::forge::MARKER_TOPIC;
 use ferry::health::HealthState;
 use ferry::scheduler::{Scheduler, SchedulerConfig, SharedStatus, Syncer, run_once};
-use ferry::sync::{ErrorKind, SyncOutcome, SyncResult, sync_repo};
+use ferry::sync::{ErrorKind, SyncOutcome, SyncStatus, sync_repo};
 use ferry::telemetry::{Metrics, NoopMetrics, RecordingMetrics};
 use support::{FakeRepo, World, assert_error, assert_no_delete, assert_synced};
 use tokio::task::JoinHandle;
@@ -136,7 +136,13 @@ fn scheduler_config(poll_interval: Duration, tick: Duration) -> SchedulerConfig 
 
 #[tokio::test(start_paused = true)]
 async fn case_19_failing_entry_is_not_retried_before_its_backoff() {
-    let failure = SyncOutcome::error(ErrorKind::Network, Duration::ZERO);
+    let failure = SyncOutcome {
+        status: SyncStatus::Failed {
+            kind: ErrorKind::Network,
+            retry_after: None,
+        },
+        duration: Duration::ZERO,
+    };
     let syncer = ScriptedSyncer::new(Vec::new(), failure);
     let entries = [World::entry("alpha")];
     let shared = SharedStatus::new(&entries);
@@ -171,8 +177,17 @@ async fn case_19_failing_entry_is_not_retried_before_its_backoff() {
 
 #[tokio::test(start_paused = true)]
 async fn case_19b_success_resets_the_backoff_and_polls_on_the_interval() {
-    let failure = SyncOutcome::error(ErrorKind::Network, Duration::ZERO);
-    let success = SyncOutcome::success(SyncResult::Noop, Duration::ZERO);
+    let failure = SyncOutcome {
+        status: SyncStatus::Failed {
+            kind: ErrorKind::Network,
+            retry_after: None,
+        },
+        duration: Duration::ZERO,
+    };
+    let success = SyncOutcome {
+        status: SyncStatus::Noop,
+        duration: Duration::ZERO,
+    };
     let syncer = ScriptedSyncer::new(vec![failure.clone(), failure], success);
     let entries = [World::entry("alpha")];
     let shared = SharedStatus::new(&entries);
@@ -293,7 +308,7 @@ async fn real_scheduler_records_results_and_error_kinds() {
         metrics
             .outcomes_for(&created.repo_tag())
             .iter()
-            .any(|outcome| outcome.refs_pruned == 1)
+            .any(|outcome| outcome.refs().1 == 1)
     })
     .await;
     wait_for(1, missing.repo_tag()).await;
@@ -302,14 +317,14 @@ async fn real_scheduler_records_results_and_error_kinds() {
     task.await.expect("scheduler exits");
 
     let outcomes = metrics.outcomes_for(&created.repo_tag());
-    assert_eq!(outcomes[0].result, SyncResult::Synced);
+    assert_eq!(outcomes[0].result_tag(), "synced");
     assert_eq!(outcomes[0].error_kind_tag(), "none");
-    assert_eq!(outcomes[1].result, SyncResult::Noop);
+    assert_eq!(outcomes[1].result_tag(), "noop");
     let pruned = outcomes
         .iter()
-        .find(|outcome| outcome.refs_pruned == 1)
+        .find(|outcome| outcome.refs().1 == 1)
         .expect("prune outcome");
-    assert_eq!(pruned.result, SyncResult::Synced);
+    assert_eq!(pruned.result_tag(), "synced");
     // Case 10 and case 12.
     assert_error(
         &metrics.outcomes_for(&missing.repo_tag())[0],
@@ -407,7 +422,10 @@ impl Syncer for ProbeSyncer {
         self.peak.fetch_max(running, Ordering::SeqCst);
         tokio::time::sleep(self.duration).await;
         self.running.fetch_sub(1, Ordering::SeqCst);
-        SyncOutcome::success(SyncResult::Noop, self.duration)
+        SyncOutcome {
+            status: SyncStatus::Noop,
+            duration: self.duration,
+        }
     }
 }
 
@@ -468,18 +486,31 @@ async fn a_panicking_sync_is_an_internal_error_for_that_entry_only() {
     assert_error(&bad[0], ErrorKind::Internal);
     let good = metrics.outcomes_for("owner/good");
     assert_eq!(good.len(), 2);
-    assert_eq!(good[0].result, SyncResult::Noop);
+    assert_eq!(good[0].result_tag(), "noop");
     assert_eq!(shared.snapshot()[0].consecutive_failures, 2);
     assert_eq!(shared.snapshot()[1].consecutive_failures, 0);
 }
 
 #[tokio::test(start_paused = true)]
 async fn a_rate_limited_entry_waits_for_the_forge_but_not_forever() {
-    let limited = SyncOutcome::error(ErrorKind::RateLimited, Duration::ZERO)
-        .with_retry_after(Some(Duration::from_secs(1000)));
-    let hostile = SyncOutcome::error(ErrorKind::RateLimited, Duration::ZERO)
-        .with_retry_after(Some(Duration::MAX));
-    let success = SyncOutcome::success(SyncResult::Noop, Duration::ZERO);
+    let limited = SyncOutcome {
+        status: SyncStatus::Failed {
+            kind: ErrorKind::RateLimited,
+            retry_after: Some(Duration::from_secs(1000)),
+        },
+        duration: Duration::ZERO,
+    };
+    let hostile = SyncOutcome {
+        status: SyncStatus::Failed {
+            kind: ErrorKind::RateLimited,
+            retry_after: Some(Duration::MAX),
+        },
+        duration: Duration::ZERO,
+    };
+    let success = SyncOutcome {
+        status: SyncStatus::Noop,
+        duration: Duration::ZERO,
+    };
     let syncer = ScriptedSyncer::new(vec![limited, hostile], success);
     let entries = [World::entry("alpha")];
     let (shutdown, task) = spawn_scheduler(

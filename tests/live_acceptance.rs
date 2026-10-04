@@ -36,7 +36,7 @@ use ferry::config::{
 };
 use ferry::forge::{ForgejoClient, GithubClient, http_client};
 use ferry::git::{Git, GitRunner, Remote, Side};
-use ferry::sync::{SyncContext, SyncOutcome, SyncResult, sync_repo};
+use ferry::sync::{SyncContext, SyncOutcome, sync_repo};
 use tokio_util::sync::CancellationToken;
 
 fn required(name: &str) -> String {
@@ -80,8 +80,10 @@ fn clone_and_fsck(url: &str, into: &Path, runner: &GitRunner) {
             .env("GIT_LFS_SKIP_SMUDGE", "0")
             .env("GIT_ASKPASS", env!("CARGO_BIN_EXE_ferry"))
             .env("FERRY_ASKPASS", "1")
-            .env("FERRY_ASKPASS_GITHUB_HOST", &settings.github_host)
-            .env("FERRY_ASKPASS_FORGEJO_HOST", &settings.forgejo_host)
+            .env("FERRY_ASKPASS_GITHUB_HOST", &settings.github.host)
+            .env("FERRY_ASKPASS_GITHUB_SCHEME", &settings.github.scheme)
+            .env("FERRY_ASKPASS_FORGEJO_HOST", &settings.forgejo.host)
+            .env("FERRY_ASKPASS_FORGEJO_SCHEME", &settings.forgejo.scheme)
             .env("FERRY_ASKPASS_FORGEJO_USER", &settings.forgejo_user);
         let output = command.output().expect("git runs");
         assert!(
@@ -136,9 +138,16 @@ async fn mirrors_a_real_repository_with_lfs() {
     let tokens = token_files
         .load()
         .expect("the Forgejo token file is readable");
-    let runner = GitRunner::from_config(&config, &token_files, &tokens, CancellationToken::new())
-        .expect("git runner")
-        .with_askpass_path(env!("CARGO_BIN_EXE_ferry"));
+    let runner = GitRunner::new(
+        ferry::git::GitSettings::from_config(
+            &config,
+            &token_files,
+            &tokens,
+            CancellationToken::new(),
+        )
+        .expect("git runner"),
+    )
+    .with_askpass_path(env!("CARGO_BIN_EXE_ferry"));
     runner
         .lfs_version()
         .await
@@ -155,10 +164,7 @@ async fn mirrors_a_real_repository_with_lfs() {
 
     let first: SyncOutcome = sync_repo(&ctx, entry).await;
     println!("first pass: {first:?}");
-    assert!(
-        matches!(first.result, SyncResult::Synced | SyncResult::Noop),
-        "{first:?}"
-    );
+    assert!(matches!(first.result_tag(), "synced" | "noop"), "{first:?}");
 
     let source = Remote {
         url: format!("{}/{github_repo}.git", config.github.git_url),
@@ -196,5 +202,5 @@ async fn mirrors_a_real_repository_with_lfs() {
 
     let second = sync_repo(&ctx, entry).await;
     println!("second pass: {second:?}");
-    assert_eq!(second.result, SyncResult::Noop, "{second:?}");
+    assert_eq!(second.result_tag(), "noop", "{second:?}");
 }

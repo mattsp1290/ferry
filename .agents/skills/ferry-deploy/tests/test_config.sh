@@ -33,6 +33,9 @@ fail NAMESPACE
 sed '/^RELEASE=/d' "$tmp/env" > "$FERRY_DEPLOY_CONFIG/deploy.env"
 fail 'missing required key RELEASE'
 cp "$tmp/env" "$FERRY_DEPLOY_CONFIG/deploy.env"
+printf 'NODE_SELECTOR=kubernetes.io/arch=amd64\n' >> "$FERRY_DEPLOY_CONFIG/deploy.env"
+fail 'unknown key NODE_SELECTOR'
+cp "$tmp/env" "$FERRY_DEPLOY_CONFIG/deploy.env"
 printf 'UNKNOWN=x\n' >> "$FERRY_DEPLOY_CONFIG/deploy.env"
 fail 'unknown key UNKNOWN'
 cp "$tmp/env" "$FERRY_DEPLOY_CONFIG/deploy.env"
@@ -51,9 +54,8 @@ fail 'git work tree|unexpected entry'
 rm -rf "$FERRY_DEPLOY_CONFIG/.git"
 source "$skill/scripts/lib/config.sh"
 # Optional inherited settings must never bypass deploy.env validation.
-NODE_SELECTOR='unsafe;execute' HELM_TIMEOUT='unsafe;execute' IMAGE_PUSH_PATH='unsafe;execute' BASE_PUSH_PATH='unsafe;execute' bash -c '
+HELM_TIMEOUT='unsafe;execute' IMAGE_PUSH_PATH='unsafe;execute' BASE_PUSH_PATH='unsafe;execute' bash -c '
     source "$1/scripts/lib/config.sh"
-    [ "$NODE_SELECTOR" = kubernetes.io/arch=amd64 ]
     [ "$HELM_TIMEOUT" = 5m ]
     [ "$IMAGE_PUSH_PATH" = ferry/ferry ]
     [ "$BASE_PUSH_PATH" = ferry/base ]

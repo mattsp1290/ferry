@@ -35,51 +35,21 @@ spec:
       # Shutdown budget: scheduler grace 25 + cancellation grace 12 + reap 2 + flush 5 = 44 seconds.
       terminationGracePeriodSeconds: 50
       securityContext:
-        # runAsUser, runAsGroup, and runAsNonRoot are set per container: the
-        # optional fix-permissions initContainer must run as root.
-        fsGroup: 10001
-        seccompProfile:
-          type: RuntimeDefault
+        {{- include "ferry.podSecurityContext" . | nindent 8 }}
       {{- with .Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}
       {{- end }}
       {{- if .Values.cache.fixPermissions }}
       initContainers:
-        - name: fix-permissions
-          image: {{ $image | quote }}
-          imagePullPolicy: {{ .Values.image.pullPolicy }}
-          # local-path volumes are hostPath-backed and ignore fsGroup. The
-          # mount point is enough: ferry creates everything below it.
-          command: ["chown", "10001:10001", "/var/lib/ferry"]
-          securityContext:
-            runAsNonRoot: false
-            runAsUser: 0
-            runAsGroup: 0
-            readOnlyRootFilesystem: true
-            allowPrivilegeEscalation: false
-            capabilities:
-              drop: ["ALL"]
-              add: ["CHOWN"]
-          resources:
-            requests: { cpu: 10m, memory: 16Mi }
-            limits: { cpu: 100m, memory: 64Mi }
-          volumeMounts:
-            - name: cache
-              mountPath: /var/lib/ferry
+        {{- include "ferry.fixPermissionsContainer" . | nindent 8 }}
       {{- end }}
       containers:
         - name: ferry
           image: {{ $image | quote }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           securityContext:
-            runAsNonRoot: true
-            runAsUser: 10001
-            runAsGroup: 10001
-            readOnlyRootFilesystem: true
-            allowPrivilegeEscalation: false
-            capabilities:
-              drop: ["ALL"]
+            {{- include "ferry.containerSecurityContext" . | nindent 12 }}
           env:
             - name: FERRY_CONFIG
               value: /etc/ferry/ferry.toml
@@ -133,39 +103,9 @@ spec:
             - name: config
               mountPath: /etc/ferry
               readOnly: true
-            - name: credentials
-              mountPath: /var/run/secrets/ferry
-              readOnly: true
-            - name: cache
-              mountPath: /var/lib/ferry
-            - name: tmp
-              mountPath: /tmp
-            {{- if eq $transport "socket" }}
-            - name: datadog-socket
-              mountPath: /var/run/datadog
-              readOnly: true
-            {{- end }}
+            {{- include "ferry.runtimeMounts" . | nindent 12 }}
       volumes:
         - name: config
           configMap:
             name: {{ include "ferry.fullname" . }}
-        - name: credentials
-          secret:
-            secretName: {{ .Values.credentialsSecret | quote }}
-            # 0440 octal. Written in decimal because YAML 1.1 and 1.2 parsers
-            # disagree on a leading zero. Kubernetes projects Secret files as
-            # root:<fsGroup>, so UID 10001 reads them through the group.
-            # Without an items list every key present is projected, so a
-            # missing github-token key just means no file.
-            defaultMode: 288
-        - name: cache
-          persistentVolumeClaim:
-            claimName: {{ include "ferry.fullname" . }}-cache
-        - name: tmp
-          emptyDir: {}
-        {{- if eq $transport "socket" }}
-        - name: datadog-socket
-          hostPath:
-            path: {{ .Values.datadog.socketHostPath | quote }}
-            type: Directory
-        {{- end }}
+        {{- include "ferry.runtimeVolumes" . | nindent 8 }}

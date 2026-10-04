@@ -247,30 +247,9 @@ impl fmt::Debug for DogstatsdMetrics {
 }
 
 impl DogstatsdMetrics {
-    /// Connects with the production rotation interval (`UDP_ROTATION_INTERVAL`).
-    pub fn connect(target: &DogstatsdTarget, tags: &ConstTags) -> io::Result<Self> {
-        Self::connect_with_initial_warning(target, tags).map(|(metrics, _)| metrics)
-    }
-
-    /// Like `connect` with an explicit UDP rotation interval (tests use a short one).
-    /// The interval is ignored for Unix sockets.
-    pub fn connect_with_rotation(
-        target: &DogstatsdTarget,
-        tags: &ConstTags,
-        rotation: Duration,
-    ) -> io::Result<Self> {
-        Self::connect_with_warning(target, tags, rotation).map(|(metrics, _)| metrics)
-    }
-
-    /// Keeps the initial DNS failure available until a logging subscriber exists.
-    pub fn connect_with_initial_warning(
-        target: &DogstatsdTarget,
-        tags: &ConstTags,
-    ) -> io::Result<(Self, Option<String>)> {
-        Self::connect_with_warning(target, tags, UDP_ROTATION_INTERVAL)
-    }
-
-    fn connect_with_warning(
+    /// Connects the backend. Rotation is ignored for Unix sockets. The
+    /// warning is returned so it can be logged after a subscriber exists.
+    pub fn connect(
         target: &DogstatsdTarget,
         tags: &ConstTags,
         rotation: Duration,
@@ -323,7 +302,7 @@ impl DogstatsdMetrics {
 impl Metrics for DogstatsdMetrics {
     fn sync_finished(&self, entry: &RepoEntry, outcome: &SyncOutcome) {
         let repo = entry.repo_tag();
-        let result = outcome.result.as_str();
+        let result = outcome.result_tag();
         self.client
             .count_with_tags(SYNC_RUNS, 1_u64)
             .with_tag("repo", &repo)
@@ -336,11 +315,11 @@ impl Metrics for DogstatsdMetrics {
             .with_tag("result", result)
             .send();
         self.client
-            .count_with_tags(SYNC_REFS_CHANGED, u64::from(outcome.refs_changed))
+            .count_with_tags(SYNC_REFS_CHANGED, u64::from(outcome.refs().0))
             .with_tag("repo", &repo)
             .send();
         self.client
-            .count_with_tags(SYNC_REFS_PRUNED, u64::from(outcome.refs_pruned))
+            .count_with_tags(SYNC_REFS_PRUNED, u64::from(outcome.refs().1))
             .with_tag("repo", &repo)
             .send();
     }

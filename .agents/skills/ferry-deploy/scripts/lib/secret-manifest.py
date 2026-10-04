@@ -2,27 +2,18 @@
 """Validate descriptor tokens, then emit a whole Secret or send it to SSH."""
 import base64
 import json
-import os
 import sys
 import subprocess
 
 
-def token(descriptor, required):
-    try:
-        with os.fdopen(descriptor, "rb", closefd=False) as stream:
-            value = stream.read().decode("utf-8").rstrip()
-    except (UnicodeError, OSError):
-        sys.exit("Invalid token file contents")
-    if any(char in value for char in "\r\n\x00") or (required and not value):
-        sys.exit("Invalid token file contents")
-    return base64.b64encode(value.encode("utf-8")).decode("ascii") if value else None
-
+sys.dont_write_bytecode = True
+from credentials import read_token
 
 namespace, name = sys.argv[1:3]
-data = {"forgejo-token": token(8, True)}
-github = token(9, False)
+data = {"forgejo-token": base64.b64encode(read_token(3).encode()).decode("ascii")}
+github = read_token(4, required=False)
 if github:
-    data["github-token"] = github
+    data["github-token"] = base64.b64encode(github.encode()).decode("ascii")
 manifest = json.dumps({"apiVersion": "v1", "kind": "Secret", "type": "Opaque",
                             "metadata": {"name": name, "namespace": namespace}, "data": data})
 if len(sys.argv) == 3:

@@ -11,7 +11,7 @@ use ferry::config::RepoEntry;
 use ferry::emitter::{EmitterConfig, run_emitter};
 use ferry::health::HealthState;
 use ferry::scheduler::{Scheduler, SchedulerConfig, SharedStatus, Syncer, run_once};
-use ferry::sync::{ErrorKind, SyncOutcome, SyncResult, sync_repo};
+use ferry::sync::{ErrorKind, SyncOutcome, SyncStatus, sync_repo};
 use ferry::telemetry::logging::dd_ids;
 use ferry::telemetry::metrics::MetricEvent;
 use ferry::telemetry::{self, Metrics, NoopMetrics, RecordingMetrics, Settings};
@@ -39,7 +39,7 @@ async fn one_sync_is_one_trace_with_a_span_for_each_step_that_ran() {
     let (_capture, exporter, _subscriber) = scoped_json_capture();
 
     let outcome = sync_repo(&world.context(), &entry).await;
-    assert_eq!(outcome.result, SyncResult::Synced, "{outcome:?}");
+    assert_eq!(outcome.result_tag(), "synced", "{outcome:?}");
     let spans = exporter.get_finished_spans().expect("spans");
 
     let root = root(&spans);
@@ -114,7 +114,13 @@ async fn an_error_outcome_marks_the_sync_span_as_an_error() {
     let (capture, exporter, _subscriber) = scoped_json_capture();
 
     let outcome = sync_repo(&world.context(), &entry).await;
-    assert_eq!(outcome.error_kind, Some(ErrorKind::SourceMissing));
+    assert!(matches!(
+        outcome.status,
+        SyncStatus::Failed {
+            kind: ErrorKind::SourceMissing,
+            ..
+        }
+    ));
     let spans = exporter.get_finished_spans().expect("spans");
 
     let root = root(&spans);
@@ -175,7 +181,7 @@ async fn the_result_log_line_carries_the_trace_id_of_its_sync() {
     // A pass that changes nothing logs below info, to limit volume.
     let before = capture.json_lines().len();
     let outcome = sync_repo(&ctx, &entry).await;
-    assert_eq!(outcome.result, SyncResult::Noop);
+    assert_eq!(outcome.result_tag(), "noop");
     let noop: Vec<_> = capture.json_lines()[before..]
         .iter()
         .filter(|line| line["message"] == "sync finished")
@@ -239,7 +245,7 @@ async fn sync_completes_with_telemetry_disabled() {
     .await;
 
     let outcome = outcomes[0].as_ref().expect("the entry ran");
-    assert_eq!(outcome.result, SyncResult::Synced, "{outcome:?}");
+    assert_eq!(outcome.result_tag(), "synced", "{outcome:?}");
     assert_eq!(world.dest_refs(&entry), source.refs());
 }
 
@@ -261,9 +267,18 @@ impl Syncer for FlakySyncer {
         let remaining = self.failures.load(Ordering::SeqCst);
         if remaining > 0 {
             self.failures.store(remaining - 1, Ordering::SeqCst);
-            SyncOutcome::error(ErrorKind::Network, Duration::ZERO)
+            SyncOutcome {
+                status: SyncStatus::Failed {
+                    kind: ErrorKind::Network,
+                    retry_after: None,
+                },
+                duration: Duration::ZERO,
+            }
         } else {
-            SyncOutcome::success(SyncResult::Noop, Duration::ZERO)
+            SyncOutcome {
+                status: SyncStatus::Noop,
+                duration: Duration::ZERO,
+            }
         }
     }
 }

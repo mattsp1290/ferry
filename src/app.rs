@@ -18,7 +18,7 @@ use crate::cli::exit;
 use crate::config::{Config, ConfigError, RepoEntry, TokenFiles, Tokens};
 use crate::emitter::{EmitterConfig, run_emitter};
 use crate::forge::{ForgejoClient, GithubClient, http_client};
-use crate::git::{Git, GitErrorKind, GitRunner};
+use crate::git::{Git, GitErrorKind, GitRunner, GitSettings, Side};
 use crate::health::{self, HealthState};
 use crate::scheduler::{Scheduler, SchedulerConfig, SharedStatus, Syncer, run_once};
 use crate::sync::SyncContext;
@@ -51,25 +51,23 @@ impl Failure {
 }
 
 /// Loads and validates the config. Prints every violation on failure.
-pub fn load_config(path: &Path) -> Result<Config, u8> {
+pub fn load_config(path: &Path) -> Option<Config> {
     Config::load(path)
         .and_then(|config| config.validate().map(|()| config))
-        .map_err(|error| {
-            match &error {
-                ConfigError::Invalid(violations) => {
-                    for violation in violations {
-                        eprintln!("ferry: invalid config: {violation}");
-                    }
+        .map_err(|error| match &error {
+            ConfigError::Invalid(violations) => {
+                for violation in violations {
+                    eprintln!("ferry: invalid config: {violation}");
                 }
-                other => eprintln!("ferry: {other}"),
             }
-            exit::CONFIG
+            other => eprintln!("ferry: {other}"),
         })
+        .ok()
 }
 
 /// `ferry run`: the scheduler and the health server, until SIGTERM or SIGINT.
 pub fn run(config_path: &Path) -> u8 {
-    let Ok(config) = load_config(config_path) else {
+    let Some(config) = load_config(config_path) else {
         return exit::CONFIG;
     };
     let entries = config.repos.clone();
@@ -78,7 +76,7 @@ pub fn run(config_path: &Path) -> u8 {
 
 /// `ferry sync --once`: one pass over the selected entries.
 pub fn sync_once(config_path: &Path, repo_filters: &[String]) -> u8 {
-    let Ok(config) = load_config(config_path) else {
+    let Some(config) = load_config(config_path) else {
         return exit::CONFIG;
     };
     let entries = match config.select_repos(repo_filters) {
@@ -89,6 +87,57 @@ pub fn sync_once(config_path: &Path, repo_filters: &[String]) -> u8 {
         }
     };
     execute(config, entries, Mode::Once)
+}
+
+/// `ferry refs`: read one configured remote through the canonical git runner.
+/// No cache, forge API, scheduler or telemetry backend is started.
+pub fn refs(config_path: &Path, side: Side, repo: &str) -> u8 {
+    let Some(config) = load_config(config_path) else {
+        return exit::CONFIG;
+    };
+    let entry = match config.select_repos(&[repo.to_owned()]) {
+        Ok(entries) => entries.into_iter().next().expect("one selected entry"),
+        Err(error) => {
+            eprintln!("ferry: {error}");
+            return exit::CONFIG;
+        }
+    };
+    let token_files = TokenFiles::from_env();
+    let tokens = match token_files.load() {
+        Ok(tokens) => tokens,
+        Err(error) => {
+            eprintln!("ferry: {error}");
+            return exit::CONFIG;
+        }
+    };
+    let result = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(Failure::runtime)
+        .and_then(|runtime| {
+            runtime.block_on(async {
+                let cancel = shutdown_signal()?;
+                let scratch = tempfile::tempdir().map_err(Failure::runtime)?;
+                let mut settings = GitSettings::from_config(&config, &token_files, &tokens, cancel)
+                    .map_err(Failure::runtime)?;
+                settings.cache_dir = scratch.path().to_path_buf();
+                let runner = GitRunner::new(settings);
+                let remote = crate::sync::remote_for(&config, &entry, side);
+                runner.ls_remote(&remote).await.map_err(Failure::runtime)
+            })
+        });
+    match result {
+        Ok(listed) => {
+            for (name, oid) in listed.refs.iter() {
+                println!("{oid}\t{name}");
+            }
+            exit::SUCCESS
+        }
+        Err(failure) => {
+            eprintln!("ferry: {}", failure.message);
+            failure.code
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -140,8 +189,10 @@ async fn start(
     // syncs get their grace period first.
     let cancel_syncs = CancellationToken::new();
 
-    let runner = GitRunner::from_config(config, &token_files, &tokens, cancel_syncs.clone())
-        .map_err(Failure::runtime)?;
+    let runner = GitRunner::new(
+        GitSettings::from_config(config, &token_files, &tokens, cancel_syncs.clone())
+            .map_err(Failure::runtime)?,
+    );
     // The cache directory comes first: the git runner keeps its HOME there,
     // so an unusable cache would otherwise be reported as a missing git.
     check_cache_dir(config).await?;
@@ -305,11 +356,7 @@ async fn once(
 
     let failed = outcomes
         .iter()
-        .filter(|outcome| {
-            !outcome
-                .as_ref()
-                .is_some_and(|outcome| outcome.result.is_success())
-        })
+        .filter(|outcome| !outcome.as_ref().is_some_and(|outcome| outcome.is_success()))
         .count();
     tracing::info!(repos = entries.len(), failed, "sync pass finished");
     Ok(if failed == 0 {

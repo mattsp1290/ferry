@@ -24,3 +24,7 @@ nodeSelector:
 resources:
   requests: { cpu: 100m, memory: 128Mi }
   limits: { cpu: 1000m, memory: 1Gi }
+# Temporary probe resources are rendered only by deploy preflight.
+preflight:
+  name: ""
+  probe: ""

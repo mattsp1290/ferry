@@ -18,7 +18,8 @@ use tracing::{Dispatch, info, info_span, warn};
 use tracing_subscriber::layer::SubscriberExt;
 
 use ferry::config::RepoEntry;
-use ferry::sync::outcome::{ErrorKind, SyncOutcome, SyncResult};
+use ferry::sync::outcome::{ErrorKind, SyncOutcome, SyncStatus};
+use ferry::telemetry::dogstatsd::UDP_ROTATION_INTERVAL;
 use ferry::telemetry::logging::dd_ids;
 use ferry::telemetry::tracing::{mark_error, otel_layer, parse_agent_url};
 use ferry::telemetry::{self, DogstatsdMetrics, DogstatsdTarget, LogFormat, Metrics, Settings};
@@ -132,7 +133,9 @@ fn settings_treat_empty_as_unset_and_bad_format_as_warning() {
 fn udp_metrics(rotation: Duration) -> (DogstatsdMetrics, UdpSocket) {
     let (server, url) = udp_server();
     let target = DogstatsdTarget::parse(&url).unwrap();
-    let metrics = DogstatsdMetrics::connect_with_rotation(&target, &tags(), rotation).unwrap();
+    let metrics = DogstatsdMetrics::connect(&target, &tags(), rotation)
+        .unwrap()
+        .0;
     (metrics, server)
 }
 
@@ -142,20 +145,29 @@ fn expected_datagrams() -> Vec<String> {
             "ferry.sync.runs:1|c|#{CONST_TAGS},repo:acme/widget,result:error,error_kind:network"
         ),
         format!("ferry.sync.duration:1.5|d|#{CONST_TAGS},repo:acme/widget,result:error"),
-        format!("ferry.sync.refs_changed:3|c|#{CONST_TAGS},repo:acme/widget"),
-        format!("ferry.sync.refs_pruned:1|c|#{CONST_TAGS},repo:acme/widget"),
+        format!("ferry.sync.refs_changed:0|c|#{CONST_TAGS},repo:acme/widget"),
+        format!("ferry.sync.refs_pruned:0|c|#{CONST_TAGS},repo:acme/widget"),
     ]
 }
 
 fn error_outcome() -> SyncOutcome {
-    SyncOutcome::error(ErrorKind::Network, Duration::from_millis(1500)).with_refs(3, 1)
+    SyncOutcome {
+        status: SyncStatus::Failed {
+            kind: ErrorKind::Network,
+            retry_after: None,
+        },
+        duration: Duration::from_millis(1500),
+    }
 }
 
 fn exercise_all_methods(metrics: &dyn Metrics) {
     metrics.sync_finished(&entry(), &error_outcome());
     metrics.sync_finished(
         &entry(),
-        &SyncOutcome::success(SyncResult::Noop, Duration::from_secs(2)),
+        &SyncOutcome {
+            status: SyncStatus::Noop,
+            duration: Duration::from_secs(2),
+        },
     );
     metrics.repo_state(&entry(), Duration::from_millis(90_500), 4);
     metrics.repos_configured(7);
@@ -201,7 +213,9 @@ fn dogstatsd_omits_env_tag_when_unset() {
     let target = DogstatsdTarget::parse(&url).unwrap();
     let mut tags = tags();
     tags.env = None;
-    let metrics = DogstatsdMetrics::connect(&target, &tags).unwrap();
+    let metrics = DogstatsdMetrics::connect(&target, &tags, UDP_ROTATION_INTERVAL)
+        .unwrap()
+        .0;
     metrics.heartbeat();
     assert_eq!(
         recv_datagrams_udp(&server, 1),
@@ -218,7 +232,9 @@ fn dogstatsd_unix_datagram_socket() {
         .set_read_timeout(Some(Duration::from_secs(5)))
         .unwrap();
     let target = DogstatsdTarget::parse(&format!("unix://{}", path.display())).unwrap();
-    let metrics = DogstatsdMetrics::connect(&target, &tags()).unwrap();
+    let metrics = DogstatsdMetrics::connect(&target, &tags(), UDP_ROTATION_INTERVAL)
+        .unwrap()
+        .0;
 
     exercise_all_methods(&metrics);
 
@@ -234,7 +250,9 @@ fn dogstatsd_unix_send_error_is_counted_not_propagated() {
     let target = DogstatsdTarget::Unix {
         path: dir.path().join("nobody-listens.sock"),
     };
-    let metrics = DogstatsdMetrics::connect(&target, &tags()).unwrap();
+    let metrics = DogstatsdMetrics::connect(&target, &tags(), UDP_ROTATION_INTERVAL)
+        .unwrap()
+        .0;
     metrics.heartbeat();
     metrics.heartbeat();
     assert_eq!(metrics.send_error_count(), 2);
@@ -588,7 +606,7 @@ fn initial_udp_failure_is_returned_without_arming_send_error_throttle() {
         host_port: "invalid-address".into(),
     };
     let (metrics, warning) =
-        DogstatsdMetrics::connect_with_initial_warning(&target, &tags()).unwrap();
+        DogstatsdMetrics::connect(&target, &tags(), UDP_ROTATION_INTERVAL).unwrap();
     assert!(warning.unwrap().contains("initial resolve failed"));
     assert_eq!(metrics.send_error_count(), 0);
     let capture = Capture::default();

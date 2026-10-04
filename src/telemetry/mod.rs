@@ -271,7 +271,7 @@ where
                     return None;
                 }
             };
-            match DogstatsdMetrics::connect_with_initial_warning(&target, &tags) {
+            match DogstatsdMetrics::connect(&target, &tags, dogstatsd::UDP_ROTATION_INTERVAL) {
                 Ok((metrics, warning)) => {
                     warnings.extend(warning);
                     Some(Arc::new(metrics) as Arc<dyn Metrics>)
@@ -300,25 +300,20 @@ where
         }
     });
 
-    let guard = TelemetryGuard {
-        metrics_enabled: metrics.is_some(),
-        metrics: metrics.unwrap_or_else(|| Arc::new(NoopMetrics)),
-        provider,
-    };
+    let guard = TelemetryGuard { metrics, provider };
     (guard, dispatch)
 }
 
 /// Owns the telemetry backends. Dropping it shuts them down.
 pub struct TelemetryGuard {
-    metrics: Arc<dyn Metrics>,
-    metrics_enabled: bool,
+    metrics: Option<Arc<dyn Metrics>>,
     provider: Option<opentelemetry_sdk::trace::SdkTracerProvider>,
 }
 
 impl std::fmt::Debug for TelemetryGuard {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TelemetryGuard")
-            .field("metrics_enabled", &self.metrics_enabled)
+            .field("metrics_enabled", &self.metrics.is_some())
             .field("tracing_enabled", &self.provider.is_some())
             .finish()
     }
@@ -327,12 +322,14 @@ impl std::fmt::Debug for TelemetryGuard {
 impl TelemetryGuard {
     /// The metrics backend: DogStatsD when configured, otherwise a no-op.
     pub fn metrics(&self) -> Arc<dyn Metrics> {
-        Arc::clone(&self.metrics)
+        self.metrics
+            .clone()
+            .unwrap_or_else(|| Arc::new(NoopMetrics))
     }
 
     /// True when `DD_DOGSTATSD_URL` was set and valid.
     pub fn metrics_enabled(&self) -> bool {
-        self.metrics_enabled
+        self.metrics.is_some()
     }
 
     /// True when `DD_TRACE_AGENT_URL` was set and valid.

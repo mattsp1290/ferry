@@ -4,6 +4,7 @@ source "$(cd "$(dirname "$0")/../lib" && pwd)/config.sh"
 source "$SKILL_DIR/scripts/lib/values.sh"
 source "$SKILL_DIR/scripts/lib/remote.sh"
 source "$SKILL_DIR/scripts/lib/parity.sh"
+source "$REPO_ROOT/scripts/lib/extract-configmap.sh"
 invoked=$(date +%s)
 wait=false
 only_repo=''
@@ -21,18 +22,24 @@ report=$(printf '%s' "$snapshot" | jq -Rs 'split("\nFERRY_LOGS") | (.[0]|fromjso
 values=$(printf '%s' "$report" | jq -c '.values')
 failed=0
 check() {
-    if printf '%s' "$report" | jq -e "$2" >/dev/null; then printf 'ok: %s\n' "$1"; else printf 'FAIL: %s\n' "$1"; failed=1; fi
+    if printf '%s' "$report" | jq -e -f "$2" >/dev/null; then printf 'ok: %s\n' "$1"; else printf 'FAIL: %s\n' "$1"; failed=1; fi
 }
-check 'release deployed' '.status.info.status == "deployed"'
-check 'pod running, ready and node matches' '. as $r | ($r.values.nodeSelector // {} | to_entries) as $selector | ($r.pods.items | length == 1) and ($r.pods.items[0] | .status.phase == "Running" and any(.status.conditions[]?; .type == "Ready" and .status == "True")) and any($r.nodes.items[]?; .metadata.name == $r.pods.items[0].spec.nodeName and (.metadata.labels as $labels | all($selector[]; $labels[.key] == .value)))'
-check 'image digest and version' '. as $r | ($r.values.image.digest | type == "string" and startswith("sha256:")) and ($r.values.image.version | type == "string" and length > 0) and any($r.pods.items[0].spec.containers[]?; .name == "ferry" and (.image | endswith("@" + $r.values.image.digest)) and any(.env[]?; .name == "DD_VERSION" and .value == $r.values.image.version))'
-if [ "$(printf '%s' "$values" | jq -r '.datadog.transport')" != none ]; then check 'dogstatsd sends in last 15 minutes' '.logs | contains("dogstatsd send failed") | not'; fi
-printf '%s' "$report" | jq -r '.logs | split("\n")[] | fromjson? | select(.message == "sync failed" or .fields.message == "sync failed") | [(.repo // .fields.repo // "unknown"), (.error_kind // .fields.error_kind // "unknown")] | @tsv' | LC_ALL=C sort | uniq -c | sed 's/^/info: sync failed /'
+check 'release deployed' "$SKILL_DIR/scripts/jq/release-deployed.jq"
+check 'pod running, ready and node matches' "$SKILL_DIR/scripts/jq/pod-ready.jq"
+check 'image digest and version' "$SKILL_DIR/scripts/jq/image-version.jq"
+if [ "$(printf '%s' "$values" | jq -r '.datadog.transport')" != none ]; then check 'dogstatsd sends in last 15 minutes' "$SKILL_DIR/scripts/jq/recent-dogstatsd.jq"; fi
+printf '%s' "$report" | jq -r -f "$SKILL_DIR/scripts/jq/sync-errors.jq" | LC_ALL=C sort | uniq -c | sed 's/^/info: sync failed /'
 if ! "$runtime_only"; then
     PARITY_FERRY_BIN=$(ferry_binary)
     PARITY_FORGEJO_URL=$(printf '%s' "$values" | jq -r '.config.forgejo.url')
-    PARITY_FORGEJO_HOST=$(parity_forgejo_host "$PARITY_FORGEJO_URL")
-    PARITY_FORGEJO_USER=$(printf '%s' "$values" | jq -r '.config.forgejo.username')
+    umask 077
+    tmp=$(mktemp -d "${TMPDIR:-/tmp}/ferry-verify.XXXXXX")
+    trap 'rm -rf "$tmp"' EXIT
+    printf '%s\n' "$values" > "$tmp/values.json"
+    helm template "$RELEASE" "$REPO_ROOT/charts/ferry" -f "$tmp/values.json" \
+        --show-only templates/configmap.yaml > "$tmp/configmap.yaml"
+    PARITY_FERRY_TOML="$tmp/ferry.toml"
+    extract_toml "$tmp/configmap.yaml" > "$PARITY_FERRY_TOML"
     deadline=$((invoked + $(printf '%s' "$values" | jq -r '.config.sync.poll_interval_seconds') + 60))
     repos=$(printf '%s' "$values" | jq -r --arg repo "$only_repo" '.config.repos[] | select($repo == "" or .github == $repo) | [.github,.forgejo] | @tsv')
     if [ -z "$repos" ]; then printf 'FAIL: no matching allowlist entries\n'; failed=1; fi

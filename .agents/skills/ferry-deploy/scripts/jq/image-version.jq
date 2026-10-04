@@ -1,0 +1,1 @@
+. as $r | ($r.values.image.digest | type == "string" and startswith("sha256:")) and ($r.values.image.version | type == "string" and length > 0) and any($r.pods.items[0].spec.containers[]?; .name == "ferry" and (.image | endswith("@" + $r.values.image.digest)) and any(.env[]?; .name == "DD_VERSION" and .value == $r.values.image.version))

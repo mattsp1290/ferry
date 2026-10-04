@@ -4,7 +4,7 @@ secret_manifest() {
   local secret_name github=/dev/null
   secret_name=$(merged_values | jq -r '.credentialsSecret')
   [ ! -e "$CFG/secrets/github-token" ] || github="$CFG/secrets/github-token"
-  with_token_fd "$CFG/secrets/forgejo-token" 8 with_token_fd "$github" 9 \
+  with_token_fd "$CFG/secrets/forgejo-token" 3 with_token_fd "$github" 4 \
     python3 "$SKILL_DIR/scripts/lib/secret-manifest.py" "$NAMESPACE" "$secret_name" "$@"
 }
 apply_secret() {
