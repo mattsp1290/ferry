@@ -23,6 +23,7 @@ config_pattern() {
         REGISTRY_INSECURE) pattern='^(true|false)$' ;;
         IMAGE_PULL_REPOSITORY) pattern='^[A-Za-z0-9.-]+(:[0-9]+)?(/[a-z0-9._-]+)+$' ;;
         IMAGE_PUSH_PATH|BASE_PUSH_PATH) pattern='^[a-z0-9._-]+(/[a-z0-9._-]+)*$' ;;
+        FORGEJO_CHECK_URL) pattern='^https://[A-Za-z0-9.-]+(:[0-9]+)?(/[A-Za-z0-9._/-]*)?$' ;;
         HELM_TIMEOUT) pattern='^[0-9]+[smh]$' ;;
         *) config_error "$CFG/deploy.env: unknown key $key" ;;
     esac
@@ -51,7 +52,7 @@ config_load() {
     if git -C "$CFG" rev-parse --is-inside-work-tree >/dev/null 2>&1; then config_error "$CFG: must not be inside a git work tree"; fi
     case "$CFG/" in "$REPO_ROOT/"*) config_error "$CFG: must not be under ferry checkout" ;; esac
     [ -f "$CFG/deploy.env" ] || config_error "$CFG/deploy.env: required file missing"
-    unset IMAGE_PUSH_PATH BASE_PUSH_PATH HELM_TIMEOUT
+    unset IMAGE_PUSH_PATH BASE_PUSH_PATH HELM_TIMEOUT FORGEJO_CHECK_URL
     while IFS= read -r line || [ -n "$line" ]; do
         case "$line" in ''|'#'*) continue ;; esac
         case "$line" in *=*) key=${line%%=*}; value=${line#*=} ;; *) config_error "$CFG/deploy.env: expected KEY=value" ;; esac

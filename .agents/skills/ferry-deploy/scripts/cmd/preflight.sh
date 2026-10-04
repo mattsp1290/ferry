@@ -27,8 +27,9 @@ label=version; ferry --version | grep -F "$EXPECTED_COMMIT" >/dev/null && echo o
 label=lfs; check git lfs version
 label=token; check test -s /var/run/secrets/ferry/forgejo-token
 label=pvc; check sh -c 'touch /var/lib/ferry/probe && rm /var/lib/ferry/probe'
-# git's auth failure proves the TLS handshake completed. Disable credentials
-# and prompts, and never print the response (which may include repository data).
+# git's auth failure proves the configured Forgejo route responds. HTTPS
+# also verifies TLS; an internal HTTP route requires the owner's explicit opt-in.
+# Disable credentials and prompts, and never print repository responses.
 git -c credential.helper= ls-remote "$FORGEJO_URL" >/tmp/tls-out 2>/tmp/tls-error && echo ok:tls || {
   sed "s/'[^']*'//g" /tmp/tls-error > /tmp/tls-classification
   if grep -Ei 'authentication failed|could not read Username|repository .* not found|not found|403|401' /tmp/tls-classification >/dev/null && ! grep -Ei 'SSL|certificate|resolve|connect|TLS' /tmp/tls-classification >/dev/null; then echo ok:tls; else echo FAIL:tls; fi

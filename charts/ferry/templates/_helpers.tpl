@@ -28,6 +28,9 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 
 {{/* Fails the render on values the chart cannot work with. */}}
 {{- define "ferry.validate" -}}
+{{- if not (kindIs "bool" .Values.allowInsecureUrls) -}}
+{{- fail "allowInsecureUrls must be a boolean" -}}
+{{- end -}}
 {{- $_ := required "image.repository is required (for example registry.example.internal/ferry/ferry)" .Values.image.repository -}}
 {{- $_ := required "image.digest is required: pin the image by digest (sha256:...), never by tag" .Values.image.digest -}}
 {{- if not (has .Values.datadog.transport (list "socket" "service" "none")) -}}

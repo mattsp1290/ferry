@@ -86,3 +86,16 @@ The helper chart emits JSON and Helm merges YAML; both flow and block YAML work.
 The shared `credentials.py` reader validates both descriptor inputs as UTF-8, strips trailing Unicode whitespace, and rejects an empty required token or embedded CR, LF or NUL. An empty optional GitHub token is omitted. The entire manifest is produced in memory before SSH starts; a malformed token causes no remote call. Tokens and their base64 form never become shell variables, arguments, environment values, or temporary files. API requests disable curl startup configuration, require HTTPS, and have connection and total timeouts.
 
 The chart probes port 8080. Ferry uses its default `health.listen` address `0.0.0.0:8080`; `check` refuses a values override with a different port. The local acceptance tests additionally require `rg` (ripgrep).
+
+## Internal Forgejo routing
+
+`allowInsecureUrls: true` in owner values explicitly permits Ferry to use an
+internal HTTP Forgejo URL. It sets `FERRY_ALLOW_INSECURE_URLS=1` in the pod,
+local config validator and parity binary. The default is false; HTTPS remains
+required without this opt-in. Use it only for a trusted internal route.
+
+Optional `FORGEJO_CHECK_URL` in `deploy.env` selects a separate HTTPS base URL
+for workstation account, mirror parity and mirror-topic checks. This is needed when
+`config.forgejo.url` is an internal Kubernetes Service that the workstation
+cannot reach. Its pattern permits HTTPS host, optional port and path only;
+credentials and query strings are forbidden. The verifier renders a local-only config with this URL for read-only parity; it never changes the pod's URL.

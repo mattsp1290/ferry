@@ -90,6 +90,7 @@ for transport in socket service none; do
     continue
   fi
   ok "$label helm template"
+  check_not "$label HTTP opt-in absent by default" grep -q FERRY_ALLOW_INSECURE_URLS "$out"
   check_not "$label default chart omits preflight resources" grep -q ferry-deploy-preflight "$out"
 
   check "$label one replica" grep -qx '  replicas: 1' "$out"
@@ -185,6 +186,21 @@ check_render_fails() {
     fail "bad $value error does not name $value"
   fi
 }
+
+# Internal HTTP must fail validation without an explicit opt-in, then pass.
+cat > "$work/internal-http.yaml" <<'YAML'
+config:
+  forgejo:
+    url: http://forge.example.internal:3000
+YAML
+helm template ferry "$chart" "${common[@]}" -f "$work/internal-http.yaml" --set allowInsecureUrls=true > "$work/internal.yaml"
+check 'HTTP opt-in sets the pod environment' grep -q FERRY_ALLOW_INSECURE_URLS "$work/internal.yaml"
+extract_toml "$work/internal.yaml" > "$work/internal.toml"
+if [ -n "$ferry_bin" ]; then
+  check_not 'internal HTTP requires opt-in' env -u FERRY_ALLOW_INSECURE_URLS "$ferry_bin" check-config --config "$work/internal.toml"
+  check 'internal HTTP validates with opt-in' env FERRY_ALLOW_INSECURE_URLS=1 "$ferry_bin" check-config --config "$work/internal.toml"
+fi
+check_render_fails allowInsecureUrls "${common[@]}" --set-string allowInsecureUrls=true
 
 check_render_fails image.digest --set image.repository=x
 check_render_fails image.repository --set image.digest=sha256:0

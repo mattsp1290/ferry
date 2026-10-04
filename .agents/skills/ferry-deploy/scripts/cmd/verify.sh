@@ -30,12 +30,14 @@ check 'image digest and version' "$SKILL_DIR/scripts/jq/image-version.jq"
 if [ "$(printf '%s' "$values" | jq -r '.datadog.transport')" != none ]; then check 'dogstatsd sends in last 15 minutes' "$SKILL_DIR/scripts/jq/recent-dogstatsd.jq"; fi
 printf '%s' "$report" | jq -r -f "$SKILL_DIR/scripts/jq/sync-errors.jq" | LC_ALL=C sort | uniq -c | sed 's/^/info: sync failed /'
 if ! "$runtime_only"; then
+    configure_url_policy "$values"
     PARITY_FERRY_BIN=$(ferry_binary)
-    PARITY_FORGEJO_URL=$(printf '%s' "$values" | jq -r '.config.forgejo.url')
+    PARITY_FORGEJO_URL=${FORGEJO_CHECK_URL:-$(printf '%s' "$values" | jq -r '.config.forgejo.url')}
     umask 077
     tmp=$(mktemp -d "${TMPDIR:-/tmp}/ferry-verify.XXXXXX")
     trap 'rm -rf "$tmp"' EXIT
-    printf '%s\n' "$values" > "$tmp/values.json"
+    printf '%s\n' "$values" | jq --arg url "$PARITY_FORGEJO_URL" \
+        '.config.forgejo.url=$url' > "$tmp/values.json"
     helm template "$RELEASE" "$REPO_ROOT/charts/ferry" -f "$tmp/values.json" \
         --show-only templates/configmap.yaml > "$tmp/configmap.yaml"
     PARITY_FERRY_TOML="$tmp/ferry.toml"

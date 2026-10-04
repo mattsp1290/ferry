@@ -51,6 +51,10 @@ spec:
           securityContext:
             {{- include "ferry.containerSecurityContext" . | nindent 12 }}
           env:
+            {{- if .Values.allowInsecureUrls }}
+            - name: FERRY_ALLOW_INSECURE_URLS
+              value: "1"
+            {{- end }}
             - name: FERRY_CONFIG
               value: /etc/ferry/ferry.toml
             - name: FERRY_FORGEJO_TOKEN_FILE

@@ -1,3 +1,4 @@
+allowInsecureUrls: false # Explicit opt-in for an internal HTTP Forgejo endpoint.
 image:
   repository: ""        # required: registry.example.internal/ferry/ferry
   digest: ""            # required; the template fails when empty (sha256:...)

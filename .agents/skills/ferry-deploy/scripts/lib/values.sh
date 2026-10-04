@@ -11,3 +11,12 @@ merged_values() {
     fi
 }
 owner_values_json() { values_render -f "$CFG/values.yaml"; }
+
+# The local validator and parity binary follow the deployed URL policy.
+configure_url_policy() {
+    case "$(printf '%s' "$1" | jq -r '.allowInsecureUrls // false')" in
+        true) export FERRY_ALLOW_INSECURE_URLS=1 ;;
+        false) unset FERRY_ALLOW_INSECURE_URLS ;;
+        *) config_error 'allowInsecureUrls must be a boolean' ;;
+    esac
+}

@@ -18,6 +18,7 @@ case "$remote_version" in v3.*) ;; *) printf 'Control-host Helm major version mu
 ssh -o BatchMode=yes -o ConnectTimeout=15 "$CONTROL_SSH" "kubectl --kubeconfig $KUBECONFIG_PATH get nodes" >/dev/null
 owner_values_json | jq -e '.image // {} | has("repository") or has("digest") or has("version")' >/dev/null && config_error "$CFG/values.yaml: image.repository, image.digest and image.version are supplied by the skill"
 values=$(merged_values)
+configure_url_policy "$values"
 printf '%s\n' "$values" | jq -e '(.config.health.listen // "0.0.0.0:8080") | test(":8080$")' >/dev/null || config_error "config.health.listen must use port 8080 for the chart probes"
 if [ "$show" = 1 ]; then printf '%s\n' "$values"; fi
 binary=$(ferry_binary)
@@ -33,7 +34,7 @@ check_api() {
     python3 "$SKILL_DIR/scripts/lib/token-curl.py" "$1" "$2" "$3"
 }
 if [ "$forgejo" = 1 ]; then
-    url=$(printf '%s\n' "$values" | jq -er '.config.forgejo.url')
+    url=${FORGEJO_CHECK_URL:-$(printf '%s\n' "$values" | jq -er '.config.forgejo.url')}
     username=$(printf '%s\n' "$values" | jq -er '.config.forgejo.username')
     with_token_fd "$CFG/secrets/forgejo-token" 3 check_api "$url/api/v1/user" forgejo "$username"
 fi

@@ -14,7 +14,15 @@ printf 'obviously-fake-token\n' > "$CFG/secrets/forgejo-token"
 cat > "$tmp/bin/helm" <<'SH'
 #!/usr/bin/env bash
 case " $* " in
- *' template '*) cat "$VERIFY_TEST_ROOT/values" ;;
+ *' template '* )
+    case " $* " in
+      *' --show-only templates/configmap.yaml '* )
+        while [ "$#" -gt 0 ]; do
+          if [ "$1" = -f ]; then cp "$2" "$VERIFY_TEST_ROOT/local-values"; break; fi
+          shift
+        done ;;
+    esac
+    cat "$VERIFY_TEST_ROOT/values" ;;
  *) exit 1 ;;
 esac
 SH
@@ -51,6 +59,10 @@ export FERRY_BIN="$tmp/bin/ferry"
 cat > "$tmp/bin/ferry" <<'SH'
 #!/usr/bin/env bash
 [ "$1" = refs ] && [ "$2" = --config ] && [ -f "$3" ] && [ "$4" = --side ]
+if [ "${VERIFY_EXPECT_OPERATOR:-}" = 1 ]; then
+  [ "${FERRY_ALLOW_INSECURE_URLS:-}" = 1 ]
+  jq -e '.config.forgejo.url=="https://operator.example.internal"' "$VERIFY_TEST_ROOT/local-values" >/dev/null
+fi
 case "$5" in
  github) printf 'abcd\trefs/heads/main\n' ;;
  forgejo) n=$(cat "$VERIFY_TEST_ROOT/attempt"); n=$((n + 1)); printf '%s\n' "$n" > "$VERIFY_TEST_ROOT/attempt"
@@ -81,6 +93,16 @@ bash "$root/.agents/skills/ferry-deploy/scripts/cmd/verify.sh" --wait > "$tmp/ou
 [ "$(cat "$tmp/attempt")" = 3 ]
 [ "$(cat "$tmp/time")" = 130 ]
 grep -q 'ok: mirror topic' "$tmp/output"
+# Workstation parity uses the explicit HTTPS operator route while deployed
+# values retain the internal HTTP endpoint and its opt-in.
+printf '\nFORGEJO_CHECK_URL=https://operator.example.internal\n' >> "$CFG/deploy.env"
+jq '.allowInsecureUrls=true | .config.forgejo.url="http://forge.example.internal:3000"' "$tmp/values" > "$tmp/new-values"
+mv "$tmp/new-values" "$tmp/values"
+jq --slurpfile values "$tmp/values" '.values += $values[0]' "$tmp/good" > "$tmp/report"
+export VERIFY_EXPECT_OPERATOR=1
+bash "$root/.agents/skills/ferry-deploy/scripts/cmd/verify.sh" > "$tmp/output"
+unset VERIFY_EXPECT_OPERATOR
+
 cat > "$tmp/bin/curl" <<'SH'
 #!/usr/bin/env bash
 cat > /dev/null

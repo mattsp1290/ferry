@@ -69,3 +69,11 @@ block=$(merged_values)
 printf 'cache: {size: 40Gi}\n' > "$CFG/state/preflight.yaml"
 [ "$(merged_values | jq -r '.cache.size')" = 30Gi ]
 printf 'ok: config validation, safe patterns and Helm values merging\n'
+
+config_pattern FORGEJO_CHECK_URL https://git.example.internal
+if config_pattern FORGEJO_CHECK_URL http://git.example.internal; then exit 1; fi
+if config_pattern FORGEJO_CHECK_URL https://user@git.example.internal; then exit 1; fi
+configure_url_policy '{"allowInsecureUrls":true}'
+[ "$FERRY_ALLOW_INSECURE_URLS" = 1 ]
+configure_url_policy '{}'
+[ -z "${FERRY_ALLOW_INSECURE_URLS:-}" ]
