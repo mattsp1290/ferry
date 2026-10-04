@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+command -v rg >/dev/null || { printf 'test requires rg\n' >&2; exit 1; }
 skill=$(cd "$(dirname "$0")/.." && pwd)
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT

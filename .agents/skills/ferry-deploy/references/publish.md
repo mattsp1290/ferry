@@ -17,3 +17,7 @@ Before the first shared deployment, test real publishing against a throwaway
 local `crane registry serve`: verify both digests, the linux/amd64 base manifest,
 `docker run --platform linux/amd64 <reference> --version`, and tag reuse on a
 second publish. Remove only the throwaway registry process afterward.
+
+Only an explicit registry `MANIFEST_UNKNOWN` or `NAME_UNKNOWN` response is treated as an absent tag. Authentication, connection, and invalid-digest failures stop before building or pushing. Temporary base archives and state records are removed on failure or interruption.
+
+The Dockerfile hash intentionally reuses the previously built package set. To refresh git, git-lfs and CA certificates, update the pinned Debian base digest in `docker/base.Dockerfile`, commit it, and publish again; the changed Dockerfile generates a new base tag. Release and local helper builds use Cargo's `--locked` mode so dependency resolution cannot rewrite the checked-out lockfile.

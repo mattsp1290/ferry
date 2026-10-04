@@ -366,7 +366,7 @@ fn validate_url(field: &str, value: &str, allow_insecure: bool, violations: &mut
     let url = match Url::parse(value) {
         Ok(url) => url,
         Err(error) => {
-            violations.push(format!("{field} {value:?} is not a URL: {error}"));
+            violations.push(format!("{field} is not a URL: {error}"));
             return;
         }
     };

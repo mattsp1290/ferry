@@ -18,6 +18,9 @@ pub const ASKPASS_ENV: &str = "FERRY_ASKPASS";
 pub const GITHUB_HOST_ENV: &str = "FERRY_ASKPASS_GITHUB_HOST";
 /// Host (`host[:port]`) whose credentials are the Forgejo token.
 pub const FORGEJO_HOST_ENV: &str = "FERRY_ASKPASS_FORGEJO_HOST";
+/// URL schemes whose prompts may receive credentials.
+pub const GITHUB_SCHEME_ENV: &str = "FERRY_ASKPASS_GITHUB_SCHEME";
+pub const FORGEJO_SCHEME_ENV: &str = "FERRY_ASKPASS_FORGEJO_SCHEME";
 /// Basic-auth username for Forgejo.
 pub const FORGEJO_USER_ENV: &str = "FERRY_ASKPASS_FORGEJO_USER";
 
@@ -44,7 +47,9 @@ pub fn host_port(url: &str) -> Option<String> {
 #[derive(Debug, Clone, Default)]
 pub struct AskpassEnv {
     pub github_host: Option<String>,
+    pub github_scheme: Option<String>,
     pub forgejo_host: Option<String>,
+    pub forgejo_scheme: Option<String>,
     pub forgejo_user: Option<String>,
     pub github_token_file: Option<PathBuf>,
     pub forgejo_token_file: Option<PathBuf>,
@@ -60,7 +65,9 @@ impl AskpassEnv {
         };
         Self {
             github_host: text(GITHUB_HOST_ENV),
+            github_scheme: Some(text(GITHUB_SCHEME_ENV).unwrap_or_else(|| "https".into())),
             forgejo_host: text(FORGEJO_HOST_ENV),
+            forgejo_scheme: Some(text(FORGEJO_SCHEME_ENV).unwrap_or_else(|| "https".into())),
             forgejo_user: text(FORGEJO_USER_ENV),
             github_token_file: path(GITHUB_TOKEN_FILE_ENV),
             forgejo_token_file: path(FORGEJO_TOKEN_FILE_ENV),
@@ -75,7 +82,7 @@ enum PromptKind {
 }
 
 /// Splits a prompt into its kind and the host of the quoted URL.
-fn parse_prompt(prompt: &str) -> Option<(PromptKind, String)> {
+fn parse_prompt(prompt: &str) -> Option<(PromptKind, String, String)> {
     let kind = if prompt.starts_with("Username for") {
         PromptKind::Username
     } else if prompt.starts_with("Password for") {
@@ -88,20 +95,24 @@ fn parse_prompt(prompt: &str) -> Option<(PromptKind, String)> {
     if end < start {
         return None;
     }
-    Some((kind, host_port(&prompt[start..end])?))
+    let url = &prompt[start..end];
+    let scheme = Url::parse(url).ok()?.scheme().to_owned();
+    Some((kind, host_port(url)?, scheme))
 }
 
 /// The answer to `prompt`, or `None` when ferry has no credential for it.
 pub fn answer(prompt: &str, env: &AskpassEnv) -> Option<String> {
-    let (kind, host) = parse_prompt(prompt)?;
+    let (kind, host, scheme) = parse_prompt(prompt)?;
     let host_matches = |configured: &Option<String>| {
         configured
             .as_deref()
             .is_some_and(|value| value.eq_ignore_ascii_case(&host))
     };
-    let (username, token_file) = if host_matches(&env.github_host) {
+    let (username, token_file) = if host_matches(&env.github_host)
+        && env.github_scheme.as_deref() == Some(&scheme)
+    {
         (GITHUB_USERNAME.to_string(), env.github_token_file.as_ref())
-    } else if host_matches(&env.forgejo_host) {
+    } else if host_matches(&env.forgejo_host) && env.forgejo_scheme.as_deref() == Some(&scheme) {
         (env.forgejo_user.clone()?, env.forgejo_token_file.as_ref())
     } else {
         return None;
@@ -139,7 +150,9 @@ mod tests {
         std::fs::write(&fj, "fj-token-not-real  \n").unwrap();
         AskpassEnv {
             github_host: Some("github.com".into()),
+            github_scheme: Some("https".into()),
             forgejo_host: Some("127.0.0.1:3000".into()),
+            forgejo_scheme: Some("http".into()),
             forgejo_user: Some("ferry".into()),
             github_token_file: Some(gh),
             forgejo_token_file: Some(fj),
@@ -198,6 +211,8 @@ mod tests {
         let env = env_with_tokens(dir.path());
         for prompt in [
             "Username for 'https://evil.example': ",
+            "Password for 'http://github.com': ",
+            "Password for 'https://127.0.0.1:3000': ",
             "Password for 'http://127.0.0.1:3001': ",
             "Password for 'http://127.0.0.1': ",
             "Password for 'https://github.com.evil.example': ",

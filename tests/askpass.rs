@@ -88,6 +88,8 @@ fn unknown_host_exits_one_and_prints_nothing() {
     let env = Env::new();
     for prompt in [
         "Password for 'https://evil.example': ",
+        "Password for 'http://github.com': ",
+        "Password for 'http://forge.example:3000': ",
         "Password for 'https://forge.example': ",
         "Password for 'https://github.com.evil.example': ",
         "not a prompt",

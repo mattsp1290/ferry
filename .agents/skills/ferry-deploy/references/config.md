@@ -13,20 +13,20 @@ $CFG/                      0700
 │   └── github-token       0600   optional
 └── state/                 0700   written only by the skill
     ├── last-publish.json  0600   commit, image digest, base digest, time
+    ├── preflight.json  0600   successful probe target, digest and values fingerprint
     ├── preflight.yaml     0600   values preflight discovered
-    ├── deployments.jsonl  0600   log: time, commit, digest, revision, action, result
-    └── gitops/            0700   Phase B: deploy key pair, known_hosts line
+    └── deployments.jsonl  0600   log: time, commit, digest, revision, action, result
 ```
 
 `values.yaml` is not secret but is private: the allowlist may name private repositories. It gets the same protection.
 
-`values.yaml` must not set `image.repository`, `image.digest`, or `image.version`. The skill supplies them . `deploy check` fails when the file sets any of them.
+`values.yaml` must not set `image.repository`, `image.digest`, or `image.version`. The skill supplies them. `deploy check` fails when the file sets any of them.
 
 The skill never writes `values.yaml`, `deploy.env`, or anything under `secrets/` after `init`.
 
 ## `deploy.env` keys
 
-Plain `KEY=value` lines, `#` comments, blank lines. The loader parses the file line by line. It never `source`s or `eval`s it. A value that does not match its key's pattern is an error that names the key and does not echo the value. No pattern admits whitespace, quotes, `$`, backticks, `;`, `&`, `|`, `<`, `>`, parentheses, or a backslash, which is what lets the skill place values in a remote command line safely .
+Plain `KEY=value` lines, `#` comments, blank lines. The loader parses the file line by line. It never `source`s or `eval`s it. A value that does not match its key's pattern is an error that names the key and does not echo the value. No pattern admits whitespace, quotes, `$`, backticks, `;`, `&`, `|`, `<`, `>`, parentheses, or a backslash, which is what lets the skill place values in a remote command line safely.
 
 | Key | Required | Meaning | Pattern | Example placeholder |
 |---|---|---|---|---|
@@ -39,10 +39,10 @@ Plain `KEY=value` lines, `#` comments, blank lines. The loader parses the file l
 | `IMAGE_PULL_REPOSITORY` | yes | Repository reference the node's runtime pulls. | `[A-Za-z0-9.-]+(:[0-9]+)?(/[a-z0-9._-]+)+` | `localhost:5000/ferry/ferry` |
 | `IMAGE_PUSH_PATH` | no | Repository path under `REGISTRY_PUSH`. Default `ferry/ferry`. | `[a-z0-9._-]+(/[a-z0-9._-]+)*` | |
 | `BASE_PUSH_PATH` | no | Default `ferry/base`. | same | |
-| `NODE_SELECTOR` | no | `key=value` for preflight pods. Default `kubernetes.io/arch=amd64`. | `[A-Za-z0-9./_-]+=[A-Za-z0-9._-]+` | |
+| `NODE_SELECTOR` | no | Legacy informational hint; pod selection uses the full Helm `nodeSelector` value. Set node labels in `values.yaml`. | `[A-Za-z0-9./_-]+=[A-Za-z0-9._-]+` | |
 | `HELM_TIMEOUT` | no | Default `5m`. | `[0-9]+[smh]` | |
 
-Phase B adds the `GITOPS_*` keys listed in the GitOps reference, with patterns in the same style. They are optional until `gitops-bootstrap` runs.
+GitOps keys and state directories are unsupported until the GitOps phase is implemented.
 
 Unknown keys are an error. A missing required key is an error that names the key.
 
@@ -52,7 +52,7 @@ Unknown keys are an error. A missing required key is an error that names the key
 
 1. `$CFG` exists and is a directory, not a symlink.
 2. `$CFG` and every entry under it are owned by the current user.
-3. `$CFG`, `secrets/`, `state/`, `state/gitops/` have mode `0700`. Every regular file has mode `0600`.
+3. `$CFG`, `secrets/`, `state/` have mode `0700`. Every regular file has mode `0600`.
 4. No entry under `$CFG` is a symlink. An unexpected entry (for example a `.DS_Store` created by Finder) fails with a message that names it and says to remove it; the skill does not delete it.
 5. `$CFG` is not inside a git work tree: `git -C "$CFG" rev-parse --is-inside-work-tree` must fail.
 6. `$CFG` is not under the ferry checkout.
@@ -79,7 +79,11 @@ The helper chart emits JSON and Helm merges YAML; both flow and block YAML work.
 
 - `deploy init` creates `$CFG` with the layout above and the right modes, copies the two example files into place, and prints the paths the owner must edit. It never overwrites an existing file. It creates no token file.
 - `deploy check` runs the validation rules, then the tool checks, the control-host checks, `merged_values`, and the `ferry check-config` render check. Flags `--forgejo` and `--github` add the token checks. Without a flag it does not open a token file.
-- The ferry binary for `check-config` and for askpass is `$FERRY_BIN` when set, otherwise `target/debug/ferry` after a `cargo build` that `check` runs itself.
+- The ferry binary for `check-config` and for askpass is `$FERRY_BIN` when set, otherwise `target/debug/ferry` after a `cargo build --locked` that `check` runs itself.
 - Token reading: one helper, `with_token_fd <path> <fd> <command…>`, opens the file on a file descriptor for the child. No shell function returns a token as a string and no shell variable holds one, and no token is exported into an environment. This is what makes success criterion 3 checkable.
 - Output: the skill prints setting names and non-secret values. It never prints the allowlist unless the operator passes `--show-values`.
 - `state/deployments.jsonl` is append-only and is a log, not a source of truth.
+
+Secret production validates both descriptor inputs as UTF-8, strips trailing Unicode whitespace, and rejects an empty required token or embedded CR, LF or NUL. An empty optional GitHub token is omitted. The entire manifest is produced in memory before SSH starts; a malformed token causes no remote call. Tokens and their base64 form never become shell variables, arguments, environment values, or temporary files. API requests disable curl startup configuration, require HTTPS, and have connection and total timeouts.
+
+The chart probes port 8080. Ferry uses its default `health.listen` address `0.0.0.0:8080`; `check` refuses a values override with a different port. The local acceptance tests additionally require `rg` (ripgrep).

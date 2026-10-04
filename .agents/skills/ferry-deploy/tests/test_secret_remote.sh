@@ -11,7 +11,7 @@ printf 'obviously-fake-github\342\200\203\n' > "$CFG/secrets/github-token"
 NAMESPACE=ferry RELEASE=ferry KUBECONFIG_PATH=/tmp/kube.conf HELM_TIMEOUT=5m NODE_SELECTOR=kubernetes.io/arch=amd64 IMAGE_PULL_REPOSITORY=localhost:5000/ferry/ferry CONTROL_SSH=admin@control.example.internal
 export SKILL_DIR CFG NAMESPACE RELEASE KUBECONFIG_PATH HELM_TIMEOUT NODE_SELECTOR IMAGE_PULL_REPOSITORY CONTROL_SSH
 config_error() { printf '%s\n' "$*" >&2; exit 2; }
-with_token_fd() { local p=$1 fd=$2; shift 2; [ "$fd" = 8 ]; "$@" 8< "$p"; }
+with_token_fd() { local p=$1 fd=$2; shift 2; case "$fd" in 8) "$@" 8< "$p" ;; 9) "$@" 9< "$p" ;; *) exit 2 ;; esac; }
 merged_values() { printf '{"credentialsSecret":"ferry-credentials"}\n'; }
 source "$SKILL_DIR/scripts/lib/remote.sh"
 source "$SKILL_DIR/scripts/lib/secret.sh"
@@ -22,7 +22,7 @@ secret_manifest | jq -e '.data|has("github-token")|not' >/dev/null
 cat > "$work/bin/ssh" <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
-shift 4
+shift 6
 printf '%s\n' "$*" >> "$RECORD/argv"
 bash -c "$*"
 SH
@@ -55,4 +55,23 @@ line=open(sys.argv[1]).readline()
 match=re.search(r'printf %s ([A-Za-z0-9+/=]+) \| base64 -d',line)
 assert match and base64.b64decode(match[1])==open(sys.argv[2],'rb').read()
 PY
+# Invalid input fails before any SSH or kubectl call, including optional tokens.
+for scenario in whitespace invalid-utf8 embedded-newline github-invalid; do
+  rm -f "$RECORD/applied" "$CFG/state/secret-restart-pending"
+  before=$(wc -l < "$RECORD/kubectl")
+  printf 'obviously-fake-forgejo\n' > "$CFG/secrets/forgejo-token"
+  rm -f "$CFG/secrets/github-token"
+  case "$scenario" in
+    whitespace) printf ' \t\n' > "$CFG/secrets/forgejo-token" ;;
+    invalid-utf8) printf '\377' > "$CFG/secrets/forgejo-token" ;;
+    embedded-newline) printf 'fake\nother' > "$CFG/secrets/forgejo-token" ;;
+    github-invalid) printf '\377' > "$CFG/secrets/github-token" ;;
+  esac
+  if apply_secret > "$work/invalid.out" 2>&1; then printf 'invalid token accepted\n' >&2; exit 1; fi
+  [ "$(wc -l < "$RECORD/kubectl")" = "$before" ]
+  [ ! -f "$RECORD/applied" ]
+  [ ! -f "$CFG/state/secret-restart-pending" ]
+  if secret_manifest > "$work/invalid.manifest" 2>/dev/null; then exit 1; fi
+  [ ! -s "$work/invalid.manifest" ]
+done
 printf 'ok: secret descriptors, trimming, apply results and literal SSH transport\n'

@@ -16,7 +16,9 @@ printf '%s\n' '{"status":{"info":{"status":"pending-upgrade"},"version":3},"valu
 SH
 chmod +x "$tmp/bin/ssh"
 printf '{"action":"rollout"}\n' > "$tmp/cfg/state/deployments.jsonl"
+: > "$tmp/cfg/state/secret-restart-pending"
 bash "$root/.agents/skills/ferry-deploy/scripts/cmd/status.sh" > "$tmp/output"
 grep -q 'rollback ferry 2' "$tmp/output"
 grep -q 'image.digest: sha256:abc' "$tmp/output"
 grep -q 'local log:' "$tmp/output"
+grep -q 'credentials: changed since the pod started; run deploy restart' "$tmp/output"

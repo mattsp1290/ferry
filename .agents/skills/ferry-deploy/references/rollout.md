@@ -7,18 +7,26 @@ or Helm values. A resource-version change leaves a restart marker until a new
 pod loads the credentials, including across interrupted runs.
 
 The temporary preflight pod and PVC are cleaned up even on failure. Discovered
-cache permissions and telemetry transport go to `state/preflight.yaml`; owner
+cache permissions and telemetry transport go to `state/preflight.yaml`. A paired
+`state/preflight.json` binds that successful result to namespace, release and image
+digest, control host, kubeconfig, image pull repository and a fingerprint of
+owner values plus chart defaults; a new preflight invalidates both records before doing any checks. Owner
 values override them. An explicit unworkable owner setting stops the run.
 
-Rollout chooses the published digest for the current commit, or accepts
-`--digest sha256:<64 hex> --version <12 hex>`. It lints locally, bundles only
-chart and values, performs a silent server-side Helm dry run, and upgrades with
+Rollout requires a successful preflight for the same namespace, release and digest
+and checks namespace ownership again before any write. It chooses the published digest for the current commit, or accepts
+`--digest sha256:<64 hex> --version <12 hex>`. For an externally published image, first run `preflight` with those same options, then `rollout` with them. It lints locally, bundles only
+chart and values, performs a silent server-side Helm dry run before applying credentials, and upgrades with
 wait, timeout, and bounded history. Inspect failure diagnostics before any
 further action. The owner values file is never edited by the skill.
 
-`restart` restarts the release Deployment and waits. `rollback` selects the
-previous deployed revision, or accepts `--revision N`; it refuses a failed or
-pending target. Verify again after either operation. Rollback restores the chart, values, and image, but leaves the credentials Secret at its last applied contents.
+`restart` restarts the release Deployment and waits. A healthy release rolls back
+to the newest superseded revision. A failed or pending release recovers the newest
+revision that is still deployed or superseded, including the last deployed
+revision after a failed upgrade. `rollback --revision N` accepts a deployed or
+superseded target and refuses a failed or pending target. The control host
+rechecks the selected history head under the release lock and refuses a stale
+selection before calling Helm rollback. Verify again after either operation. Rollback restores the chart, values, and image, but leaves the credentials Secret at its last applied contents.
 
 A pending upgrade needs a rollback to the last deployed revision on the control
 host with explicit `--kubeconfig`, release, and namespace. Do not delete Helm
@@ -28,6 +36,7 @@ host and rerun rollout. This removes its still-empty PVC and is acceptable only
 before anything has been mirrored. Keep the namespace and credentials Secret.
 The skill has no command to delete the persistent release PVC.
 
-After GitOps is enabled, recover from the workstation by checking out the fix,
-publishing, and rolling out. A later CI deploy of main can supersede an older
-workstation version.
+Interrupted credential rotation leaves a durable restart marker. `status` reports
+it, and preflight or rollout exit warns to run `deploy restart` until a new pod
+has loaded the credentials. Failed rollout attempts are recorded in the local
+deployment log.

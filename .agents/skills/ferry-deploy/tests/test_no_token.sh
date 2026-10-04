@@ -4,6 +4,13 @@ skill=$(cd "$(dirname "$0")/.." && pwd)
 source "$skill/tests/lib/stubs.sh"
 stubs_init
 trap 'rm -rf "$STUB_ROOT"' EXIT
+cp "$FERRY_DEPLOY_CONFIG/values.yaml" "$STUB_ROOT/values.yaml"
+printf '\nconfig:\n  health:\n    listen: 0.0.0.0:9090\n' >> "$FERRY_DEPLOY_CONFIG/values.yaml"
+if bash "$skill/scripts/deploy.sh" check > "$STUB_ROOT/health.out" 2>&1; then
+  printf 'non-probed health port accepted\n' >&2; exit 1
+fi
+grep -q 'must use port 8080' "$STUB_ROOT/health.out"
+cp "$STUB_ROOT/values.yaml" "$FERRY_DEPLOY_CONFIG/values.yaml"
 for command in check publish preflight rollout verify; do
   if [ "$command" = check ]; then
     bash "$skill/scripts/deploy.sh" check --forgejo > "$STUB_ROOT/$command.out" 2>&1 || { cat "$STUB_ROOT/$command.out" >&2; exit 1; }

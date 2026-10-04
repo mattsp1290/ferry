@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+command -v rg >/dev/null || { printf 'test requires rg\n' >&2; exit 1; }
 skill=$(cd "$(dirname "$0")/.." && pwd)
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
@@ -21,7 +22,7 @@ cp "$FERRY_DEPLOY_CONFIG/deploy.env" "$tmp/env"
 for value in '-oProxyCommand=x' 'a@b;touch/evil' 'a b' 'a"b'; do
     sed "s|^CONTROL_SSH=.*|CONTROL_SSH=$value|" "$tmp/env" > "$FERRY_DEPLOY_CONFIG/deploy.env"
     fail CONTROL_SSH
-    ! rg -F -q -- "$value" "$tmp/out"
+    if rg -F -q -- "$value" "$tmp/out"; then printf 'unexpected match\n' >&2; exit 1; fi
 done
 cp "$tmp/env" "$FERRY_DEPLOY_CONFIG/deploy.env"
 sed 's/^REGISTRY_PUSH=.*/REGISTRY_PUSH=registry/' "$tmp/env" > "$FERRY_DEPLOY_CONFIG/deploy.env"
@@ -38,6 +39,7 @@ cp "$tmp/env" "$FERRY_DEPLOY_CONFIG/deploy.env"
 touch "$FERRY_DEPLOY_CONFIG/.DS_Store"; chmod 600 "$FERRY_DEPLOY_CONFIG/.DS_Store"
 fail 'unexpected entry'; rm "$FERRY_DEPLOY_CONFIG/.DS_Store"
 chmod 755 "$FERRY_DEPLOY_CONFIG/state"; fail '0700'; chmod 700 "$FERRY_DEPLOY_CONFIG/state"
+# A caller cannot bypass validation by exporting the formerly proposed skip flag.
 chmod 644 "$FERRY_DEPLOY_CONFIG/secrets/forgejo-token"; export FERRY_DEPLOY_SKIP_CONFIG=1; fail '0600'; unset FERRY_DEPLOY_SKIP_CONFIG; chmod 600 "$FERRY_DEPLOY_CONFIG/secrets/forgejo-token"
 mv "$FERRY_DEPLOY_CONFIG/values.yaml" "$tmp/values"
 ln -s "$tmp/values" "$FERRY_DEPLOY_CONFIG/values.yaml"; fail 'symlink'; rm "$FERRY_DEPLOY_CONFIG/values.yaml"

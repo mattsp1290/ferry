@@ -26,7 +26,9 @@ fn remote(path: &Path) -> Remote {
 fn settings(tmp: &Path, timeout: Duration, cancel: CancellationToken) -> GitSettings {
     GitSettings {
         github_host: "github.com".into(),
+        github_scheme: "http".into(),
         forgejo_host: "forge.invalid".into(),
+        forgejo_scheme: "http".into(),
         forgejo_user: "ferry".into(),
         secrets: Vec::new(),
         ..git_settings(tmp.join("ferry-cache-dir"), timeout, cancel)

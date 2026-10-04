@@ -2,6 +2,7 @@
 set -euo pipefail
 source "$(dirname "$0")/../lib/config.sh"
 source "$SKILL_DIR/scripts/lib/values.sh"
+source "$REPO_ROOT/scripts/lib/extract-configmap.sh"
 forgejo=0; github=0; show=0
 for argument in "$@"; do
     case "$argument" in --forgejo) forgejo=1 ;; --github) github=1 ;; --show-values) show=1 ;; *) config_error "Unknown check option" ;; esac
@@ -12,11 +13,12 @@ crane version >/dev/null
 docker info >/dev/null
 jq --version >/dev/null
 cargo zigbuild --help >/dev/null
-remote_version=$(ssh -o BatchMode=yes "$CONTROL_SSH" "helm --kubeconfig $KUBECONFIG_PATH version --short")
+remote_version=$(ssh -o BatchMode=yes -o ConnectTimeout=15 "$CONTROL_SSH" "helm --kubeconfig $KUBECONFIG_PATH version --short")
 case "$remote_version" in v3.*) ;; *) printf 'Control-host Helm major version must be 3\n' >&2; exit 1 ;; esac
-ssh -o BatchMode=yes "$CONTROL_SSH" "kubectl --kubeconfig $KUBECONFIG_PATH get nodes" >/dev/null
+ssh -o BatchMode=yes -o ConnectTimeout=15 "$CONTROL_SSH" "kubectl --kubeconfig $KUBECONFIG_PATH get nodes" >/dev/null
 owner_values_json | jq -e '.image // {} | has("repository") or has("digest") or has("version")' >/dev/null && config_error "$CFG/values.yaml: image.repository, image.digest and image.version are supplied by the skill"
 values=$(merged_values)
+printf '%s\n' "$values" | jq -e '(.config.health.listen // "0.0.0.0:8080") | test(":8080$")' >/dev/null || config_error "config.health.listen must use port 8080 for the chart probes"
 if [ "$show" = 1 ]; then printf '%s\n' "$values"; fi
 binary=$(ferry_binary)
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/ferry-check.XXXXXX")
@@ -24,7 +26,7 @@ trap 'rm -rf "$tmp"' EXIT
 set -- -f "$CFG/values.yaml"
 if [ -f "$CFG/state/preflight.yaml" ]; then set -- -f "$CFG/state/preflight.yaml" "$@"; fi
 helm template "$RELEASE" "$REPO_ROOT/charts/ferry" "$@" --set image.repository=placeholder --set image.digest=sha256:0 --show-only templates/configmap.yaml > "$tmp/configmap.yaml"
-awk '/^  ferry.toml: \|/ { found=1; next } found { if ($0 ~ /^    /) print substr($0,5); else if ($0 !~ /^[[:space:]]*$/) exit }' "$tmp/configmap.yaml" > "$tmp/ferry.toml"
+extract_toml "$tmp/configmap.yaml" > "$tmp/ferry.toml"
 "$binary" check-config --config "$tmp/ferry.toml"
 # Generate curl configuration from an inherited descriptor; the shell never holds a token.
 check_api() {

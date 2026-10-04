@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+command -v rg >/dev/null || { printf 'test requires rg\n' >&2; exit 1; }
 skill=$(cd "$(dirname "$0")/.." && pwd)
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
@@ -20,8 +21,9 @@ printf '%s\n' "$*" >> "$TRACE"
 [ "$1" != --insecure ] || shift
 case $1 in
  digest)
-  case "$2" in */base:*) [ "${BASE_MISSING:-0}" != 1 ] || [ -f "$TRACE.base" ] || exit 1; printf 'sha256:%064d\n' 1 ;;
-   *) [ "$MODE" = reuse ] || [ -e "$TRACE.built" ] || exit 1; printf 'sha256:%064d\n' 2 ;; esac ;;
+  case "$MODE" in auth) echo UNAUTHORIZED >&2; exit 1 ;; network) echo 'connection refused' >&2; exit 1 ;; timeout) echo 'operation timed out' >&2; exit 1 ;; malformed) echo bad-digest; exit 0 ;; esac
+  case "$2" in */base:*) [ "${BASE_MISSING:-0}" != 1 ] || [ -f "$TRACE.base" ] || { echo MANIFEST_UNKNOWN >&2; exit 1; }; printf 'sha256:%064d\n' 1 ;;
+   *) [ "$MODE" = reuse ] || [ -e "$TRACE.built" ] || { echo MANIFEST_UNKNOWN >&2; exit 1; }; printf 'sha256:%064d\n' 2 ;; esac ;;
  push) touch "$TRACE.base" ;;
  config) echo '{"os":"linux","architecture":"amd64"}' ;;
  manifest) echo '{"schemaVersion":2,"layers":[]}' ;;
@@ -52,12 +54,12 @@ STUB
 chmod +x "$work/bin/"*
 export PATH="$work/bin:$PATH" FERRY_DEPLOY_BUILD_CMD="$work/bin/build" FERRY_DEPLOY_ASSEMBLE_CMD="$work/bin/assemble"
 bash "$entry" publish > "$work/out"
-! rg -q '^build|^assemble|^docker' "$TRACE"
+if rg -q '^build|^assemble|^docker' "$TRACE"; then printf 'unexpected match\n' >&2; exit 1; fi
 rg -q '^sha256:' "$work/out"
 MODE=build; export MODE
 bash "$entry" publish >/dev/null
 rg -q '^build' "$TRACE"
-! rg -q '^docker' "$TRACE"
+if rg -q '^docker' "$TRACE"; then printf 'unexpected match\n' >&2; exit 1; fi
 rm "$TRACE.built"
 MODE=mismatch; export MODE
 status=0; bash "$entry" publish > "$work/out" 2>&1 || status=$?
@@ -76,6 +78,28 @@ rg -q '^docker save --platform linux/amd64' "$TRACE"
 rg -q '^docker image rm' "$TRACE"
 [ -z "$(ls -A "$TMPDIR")" ]
 unset BASE_MISSING
+# Auth, transport and malformed responses stop before build or Docker writes.
+for error_mode in auth network timeout malformed; do
+  MODE=$error_mode; export MODE
+  : > "$TRACE"
+  if bash "$entry" publish > "$work/out" 2>&1; then printf 'registry failure accepted\n' >&2; exit 1; fi
+  if rg -q '^build|^assemble|^docker' "$TRACE"; then printf 'registry failure caused write\n' >&2; exit 1; fi
+done
+# A failed state-record write removes its temporary file on exit.
+MODE=reuse; export MODE
+for record_failure in failure interrupt; do
+  export RECORD_FAILURE=$record_failure
+  cat > "$work/bin/jq" <<'STUBJQ'
+#!/usr/bin/env bash
+if [ "$RECORD_FAILURE" = interrupt ]; then kill -TERM "$PPID"; sleep 0.1; fi
+exit 1
+STUBJQ
+  chmod +x "$work/bin/jq"
+  if bash "$entry" publish > "$work/out" 2>&1; then exit 1; fi
+  [ -z "$(find "$FERRY_DEPLOY_CONFIG/state" -name 'publish.*' -print)" ]
+done
+rm "$work/bin/jq"
+unset RECORD_FAILURE
 touch "$work/repo/dirty"
 status=0; bash "$entry" publish > "$work/out" 2>&1 || status=$?
 [ "$status" = 2 ]; rg -q 'clean work tree' "$work/out"

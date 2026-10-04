@@ -32,7 +32,8 @@ spec:
     spec:
       serviceAccountName: {{ include "ferry.fullname" . }}
       automountServiceAccountToken: false
-      terminationGracePeriodSeconds: 40
+      # Shutdown budget: scheduler grace 25 + cancellation grace 12 + reap 2 + flush 5 = 44 seconds.
+      terminationGracePeriodSeconds: 50
       securityContext:
         # runAsUser, runAsGroup, and runAsNonRoot are set per container: the
         # optional fix-permissions initContainer must run as root.

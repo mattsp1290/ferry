@@ -11,15 +11,26 @@ base_ref="$REGISTRY_PUSH/$BASE_PUSH_PATH:$(base_tag)"
 base_digest=''
 work=''
 local_tag=''
+record=''
 cleanup() {
+  [ -z "$record" ] || rm -f "$record"
   [ -z "$work" ] || rm -rf "$work"
   [ -z "$local_tag" ] || docker image rm "$local_tag" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
-if image_digest=$(read_digest "$image_ref" 2>/dev/null); then
-  base_digest=$(read_digest "$base_ref" 2>/dev/null) || base_digest=''
+trap 'exit 1' HUP INT TERM
+image_status=0
+image_digest=$(read_digest "$image_ref") || image_status=$?
+if [ "$image_status" = 0 ]; then
+  base_status=0
+  base_digest=$(read_digest "$base_ref") || base_status=$?
+  case "$base_status" in 0) ;; 3) base_digest='' ;; *) exit 1 ;; esac
 else
-  if ! base_digest=$(read_digest "$base_ref" 2>/dev/null); then
+  [ "$image_status" = 3 ] || exit 1
+  base_status=0
+  base_digest=$(read_digest "$base_ref") || base_status=$?
+  [ "$base_status" = 0 ] || [ "$base_status" = 3 ] || exit 1
+  if [ "$base_status" = 3 ]; then
     umask 077
     work=$(mktemp -d)
     local_tag="ferry-base:$(base_tag)"

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Config has already validated all settings interpolated into the login shell.
-remote_run() {
+remote_command() {
   local name=$1 encoded command setting extra
   shift
   case "$name" in *[!a-z-]*|'') config_error 'invalid remote script name';; esac
@@ -16,5 +16,10 @@ remote_run() {
     command="$command $extra"
   done
   command="$command bash -c \"\$(printf %s $encoded | base64 -d)\""
-  ssh -o BatchMode=yes "$CONTROL_SSH" -- "$command"
+  printf '%s\n' "$command"
+}
+remote_run() {
+  local command
+  command=$(remote_command "$@")
+  ssh -o BatchMode=yes -o ConnectTimeout=15 "$CONTROL_SSH" -- "$command"
 }

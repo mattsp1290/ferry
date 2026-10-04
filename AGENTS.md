@@ -20,7 +20,7 @@ Additional checks for the areas they cover:
 
 | Area | Command | Needs |
 |---|---|---|
-| Deployment skill | `.agents/skills/ferry-deploy/tests/run.sh` | workstation tools listed by the skill |
+| Deployment skill | `.agents/skills/ferry-deploy/tests/run.sh` | workstation tools listed by the skill, `rg` |
 | LFS mirroring | `FERRY_TEST_LFS=1 cargo test --test git_mirror` | `git-lfs` |
 | Chart | `helm lint charts/ferry --set image.repository=x --set image.digest=sha256:0 && scripts/check-chart.sh` | `helm` |
 | Cross-build | `scripts/build-binaries.sh` | `zig`, `cargo-zigbuild` |

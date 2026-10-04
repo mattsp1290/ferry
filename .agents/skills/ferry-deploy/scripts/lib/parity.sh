@@ -1,9 +1,24 @@
 #!/usr/bin/env bash
 # Credentials remain in files; ferry's askpass mode is the only reader for git.
+# Match URL normalization used by ferry's askpass::host_port.
+parity_forgejo_host() {
+    python3 -c 'import sys, urllib.parse
+try:
+    url = urllib.parse.urlsplit(sys.argv[1])
+    if url.scheme != "https" or not url.hostname or url.username is not None or url.password is not None:
+        raise ValueError()
+    host = url.hostname.encode("idna").decode("ascii").lower()
+    if ":" in host:
+        host = "[" + host + "]"
+    port = url.port
+    print(host + (":" + str(port) if port is not None and port != 443 else ""))
+except ValueError:
+    sys.exit("Invalid Forgejo HTTPS URL")' "$1"
+}
 parity_git() {
     GIT_ASKPASS="${PARITY_FERRY_BIN:-${FERRY_BIN:-$REPO_ROOT/target/debug/ferry}}" \
-    FERRY_ASKPASS=1 FERRY_ASKPASS_GITHUB_HOST=github.com \
-    FERRY_ASKPASS_FORGEJO_HOST="$PARITY_FORGEJO_HOST" \
+    FERRY_ASKPASS=1 FERRY_ASKPASS_GITHUB_HOST=github.com FERRY_ASKPASS_GITHUB_SCHEME=https \
+    FERRY_ASKPASS_FORGEJO_HOST="$PARITY_FORGEJO_HOST" FERRY_ASKPASS_FORGEJO_SCHEME=https \
     FERRY_ASKPASS_FORGEJO_USER="$PARITY_FORGEJO_USER" \
     FERRY_FORGEJO_TOKEN_FILE="$CFG/secrets/forgejo-token" \
     FERRY_GITHUB_TOKEN_FILE="$CFG/secrets/github-token" \
@@ -37,7 +52,7 @@ with os.fdopen(9, "rb", closefd=False) as stream:
 if not token or any(c in token for c in "\r\n\x00"):
     sys.exit("Invalid token file contents")
 sys.stdout.write("header = \"Authorization: token " + token.replace("\\", "\\\\").replace("\"", "\\\"") + "\"\n")' |
-        curl --disable --silent --show-error --fail --config /dev/stdin "$1"
+        curl --disable --silent --show-error --fail --proto '=https' --max-time 30 --config /dev/stdin "$1"
 }
 repo_has_mirror_topic() {
     with_token_fd "$CFG/secrets/forgejo-token" 9 parity_topic_request \

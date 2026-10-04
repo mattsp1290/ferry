@@ -582,6 +582,28 @@ fn operation_name_processor_makes_span_name_the_datadog_operation_name() {
 // ---------------------------------------------------------------------------
 
 #[test]
+fn initial_udp_failure_is_returned_without_arming_send_error_throttle() {
+    // No DNS is performed: this is not a socket address and has no port.
+    let target = DogstatsdTarget::Udp {
+        host_port: "invalid-address".into(),
+    };
+    let (metrics, warning) =
+        DogstatsdMetrics::connect_with_initial_warning(&target, &tags()).unwrap();
+    assert!(warning.unwrap().contains("initial resolve failed"));
+    assert_eq!(metrics.send_error_count(), 0);
+    let capture = Capture::default();
+    let (provider, _) = memory_provider();
+    let dispatch = json_dispatch(&capture, &provider);
+    with_default(&dispatch, || exercise_all_methods(&metrics));
+    assert!(metrics.send_error_count() > 0);
+    assert!(capture.json_lines().iter().any(|line| {
+        line["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("dogstatsd send failed"))
+    }));
+}
+
+#[test]
 fn unset_urls_disable_both_signals() {
     let capture = Capture::default();
     let (mut guard, dispatch) = telemetry::build(Settings::default(), capture.clone());

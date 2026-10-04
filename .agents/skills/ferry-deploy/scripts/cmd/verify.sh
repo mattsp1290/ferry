@@ -24,15 +24,14 @@ check() {
     if printf '%s' "$report" | jq -e "$2" >/dev/null; then printf 'ok: %s\n' "$1"; else printf 'FAIL: %s\n' "$1"; failed=1; fi
 }
 check 'release deployed' '.status.info.status == "deployed"'
-check 'pod running, ready and node matches' '. as $r | ($r.pods.items | length == 1) and ($r.pods.items[0] | .status.phase == "Running" and any(.status.conditions[]?; .type == "Ready" and .status == "True")) and any($r.nodes.items[]?; .metadata.name == $r.pods.items[0].spec.nodeName)'
+check 'pod running, ready and node matches' '. as $r | ($r.values.nodeSelector // {} | to_entries) as $selector | ($r.pods.items | length == 1) and ($r.pods.items[0] | .status.phase == "Running" and any(.status.conditions[]?; .type == "Ready" and .status == "True")) and any($r.nodes.items[]?; .metadata.name == $r.pods.items[0].spec.nodeName and (.metadata.labels as $labels | all($selector[]; $labels[.key] == .value)))'
 check 'image digest and version' '. as $r | ($r.values.image.digest | type == "string" and startswith("sha256:")) and ($r.values.image.version | type == "string" and length > 0) and any($r.pods.items[0].spec.containers[]?; .name == "ferry" and (.image | endswith("@" + $r.values.image.digest)) and any(.env[]?; .name == "DD_VERSION" and .value == $r.values.image.version))'
-check 'startup logged' '.logs | contains("ferry started")'
-if [ "$(printf '%s' "$values" | jq -r '.datadog.transport')" != none ]; then check 'dogstatsd sends' '.logs | contains("dogstatsd send failed") | not'; fi
+if [ "$(printf '%s' "$values" | jq -r '.datadog.transport')" != none ]; then check 'dogstatsd sends in last 15 minutes' '.logs | contains("dogstatsd send failed") | not'; fi
 printf '%s' "$report" | jq -r '.logs | split("\n")[] | fromjson? | select(.message == "sync failed" or .fields.message == "sync failed") | [(.repo // .fields.repo // "unknown"), (.error_kind // .fields.error_kind // "unknown")] | @tsv' | LC_ALL=C sort | uniq -c | sed 's/^/info: sync failed /'
 if ! "$runtime_only"; then
     PARITY_FERRY_BIN=$(ferry_binary)
     PARITY_FORGEJO_URL=$(printf '%s' "$values" | jq -r '.config.forgejo.url')
-    PARITY_FORGEJO_HOST=$(printf '%s' "$PARITY_FORGEJO_URL" | sed -E 's@^[a-z]+://([^/]+).*@\1@')
+    PARITY_FORGEJO_HOST=$(parity_forgejo_host "$PARITY_FORGEJO_URL")
     PARITY_FORGEJO_USER=$(printf '%s' "$values" | jq -r '.config.forgejo.username')
     deadline=$((invoked + $(printf '%s' "$values" | jq -r '.config.sync.poll_interval_seconds') + 60))
     repos=$(printf '%s' "$values" | jq -r --arg repo "$only_repo" '.config.repos[] | select($repo == "" or .github == $repo) | [.github,.forgejo] | @tsv')

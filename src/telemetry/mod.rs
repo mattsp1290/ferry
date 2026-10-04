@@ -271,8 +271,11 @@ where
                     return None;
                 }
             };
-            match DogstatsdMetrics::connect(&target, &tags) {
-                Ok(metrics) => Some(Arc::new(metrics) as Arc<dyn Metrics>),
+            match DogstatsdMetrics::connect_with_initial_warning(&target, &tags) {
+                Ok((metrics, warning)) => {
+                    warnings.extend(warning);
+                    Some(Arc::new(metrics) as Arc<dyn Metrics>)
+                },
                 Err(error) => {
                     warnings.push(format!(
                         "DogStatsD setup failed (cannot create DogStatsD socket: {error}); metrics are disabled"

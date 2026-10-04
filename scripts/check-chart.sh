@@ -50,14 +50,7 @@ probe_path() {
 }
 
 # Body of ferry.toml from the rendered ConfigMap, indentation removed.
-extract_toml() {
-  awk '
-    /^  ferry.toml: \|/ { on = 1; next }
-    on && /^    / { sub(/^    /, ""); print; next }
-    on && /^$/ { print; next }
-    on { exit }
-  ' "$1"
-}
+source scripts/lib/extract-configmap.sh
 
 # Sample allowlist, passed as a values file so that numbers take the same
 # path as a real deployment's values file.
@@ -118,7 +111,7 @@ for transport in socket service none; do
   check "$label drops all capabilities" grep -qE '^ +drop: \["ALL"\]$' "$out"
   check_not "$label no privilege escalation" grep -q 'allowPrivilegeEscalation: true' "$out"
   check "$label automountServiceAccountToken false" grep -q 'automountServiceAccountToken: false' "$out"
-  check "$label terminationGracePeriodSeconds 40" grep -q 'terminationGracePeriodSeconds: 40' "$out"
+  check "$label terminationGracePeriodSeconds 50" grep -q 'terminationGracePeriodSeconds: 50' "$out"
   check "$label checksum/config annotation" grep -qE 'checksum/config: "?[0-9a-f]{64}"?$' "$out"
   check "$label datadog logs annotation" grep -q 'ad.datadoghq.com/ferry.logs:' "$out"
   check_not "$label no fix-permissions initContainer by default" grep -q 'initContainers:' "$out"

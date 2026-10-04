@@ -16,21 +16,15 @@ fi
 config_pattern() {
     local key=$1 value=$2 pattern
     case "$key" in
-        CONTROL_SSH|GITOPS_SSH_DESTINATION) pattern='^[A-Za-z0-9._][A-Za-z0-9._-]*(@[A-Za-z0-9._][A-Za-z0-9._-]*)?$' ;;
+        CONTROL_SSH) pattern='^[A-Za-z0-9._][A-Za-z0-9._-]*(@[A-Za-z0-9._][A-Za-z0-9._-]*)?$' ;;
         KUBECONFIG_PATH) pattern='^/[A-Za-z0-9._/-]+$' ;;
         NAMESPACE|RELEASE) pattern='^[a-z0-9]([a-z0-9-]*[a-z0-9])?$'; [ ${#value} -le 63 ] || return 1 ;;
-        REGISTRY_PUSH|GITOPS_REGISTRY) pattern='^[A-Za-z0-9.-]+(:[0-9]+)?$'; case "$value" in *.*|*:*|localhost) ;; *) return 1 ;; esac ;;
-        REGISTRY_INSECURE|GITOPS_REGISTRY_INSECURE) pattern='^(true|false)$' ;;
+        REGISTRY_PUSH) pattern='^[A-Za-z0-9.-]+(:[0-9]+)?$'; case "$value" in *.*|*:*|localhost) ;; *) return 1 ;; esac ;;
+        REGISTRY_INSECURE) pattern='^(true|false)$' ;;
         IMAGE_PULL_REPOSITORY) pattern='^[A-Za-z0-9.-]+(:[0-9]+)?(/[a-z0-9._-]+)+$' ;;
         IMAGE_PUSH_PATH|BASE_PUSH_PATH) pattern='^[a-z0-9._-]+(/[a-z0-9._-]+)*$' ;;
         NODE_SELECTOR) pattern='^[A-Za-z0-9./_-]+=[A-Za-z0-9._-]+$' ;;
         HELM_TIMEOUT) pattern='^[0-9]+[smh]$' ;;
-        GITOPS_FORGEJO_REPO) pattern='^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$' ;;
-        GITOPS_FORGEJO_READ_USER|GITOPS_RUNNER_LABEL) pattern='^[A-Za-z0-9._-]+$' ;;
-        GITOPS_CI_IMAGE) pattern='^[A-Za-z0-9.-]+(:[0-9]+)?(/[a-z0-9._-]+)+@sha256:[a-fA-F0-9]{64}$' ;;
-        GITOPS_REGISTRY_LOCAL_URL) pattern='^https?://[A-Za-z0-9.-]+(:[0-9]+)?$' ;;
-        GITOPS_FORGEJO_LOCAL_URL) pattern='^https://[A-Za-z0-9.-]+(:[0-9]+)?$' ;;
-        GITOPS_KIT_DIR) pattern='^[A-Za-z0-9._/][A-Za-z0-9._/-]*$' ;;
         *) config_error "$CFG/deploy.env: unknown key $key" ;;
     esac
     [[ $value =~ $pattern ]]
@@ -44,8 +38,8 @@ config_load() {
         [ ! -L "$entry" ] || config_error "$entry: symlink forbidden"
         relative=${entry#"$CFG"}; relative=${relative#/}
         case "$relative" in
-            ''|secrets|state|state/gitops) [ -d "$entry" ] || config_error "$entry: must be a directory" ;;
-            deploy.env|values.yaml|secrets/forgejo-token|secrets/github-token|secrets/forgejo-read-token|state/last-publish.json|state/preflight.yaml|state/deployments.jsonl|state/secret-restart-pending|state/gitops/id_ed25519|state/gitops/id_ed25519.pub|state/gitops/known_hosts) [ -f "$entry" ] || config_error "$entry: must be a regular file" ;;
+            ''|secrets|state) [ -d "$entry" ] || config_error "$entry: must be a directory" ;;
+            deploy.env|values.yaml|secrets/forgejo-token|secrets/github-token|state/last-publish.json|state/preflight.yaml|state/preflight.json|state/deployments.jsonl|state/secret-restart-pending) [ -f "$entry" ] || config_error "$entry: must be a regular file" ;;
             *) config_error "$entry: unexpected entry; remove it" ;;
         esac
         mode=$(config_stat "$STAT_MODE" "$entry")
@@ -89,7 +83,7 @@ with_token_fd() {
     esac
 }
 ferry_binary() {
-    if [ -n "${FERRY_BIN:-}" ]; then printf '%s\n' "$FERRY_BIN"; else (cd "$REPO_ROOT" && cargo build >&2); printf '%s\n' "$REPO_ROOT/target/debug/ferry"; fi
+    if [ -n "${FERRY_BIN:-}" ]; then printf '%s\n' "$FERRY_BIN"; else (cd "$REPO_ROOT" && cargo build --locked >&2); printf '%s\n' "$REPO_ROOT/target/debug/ferry"; fi
 }
 config_caller=${BASH_SOURCE[1]:-}
 if [ -n "$config_caller" ]; then

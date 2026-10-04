@@ -162,25 +162,32 @@ struct RotatingUdpSink {
 }
 
 impl RotatingUdpSink {
-    fn new(host_port: String, interval: Duration, errors: Arc<SendErrors>) -> Self {
-        let conn = match UdpConn::open(&host_port) {
-            Ok(conn) => Some(Arc::new(conn)),
-            Err(error) => {
-                errors.record(&format_args!("initial resolve of {host_port}: {error}"));
-                None
-            }
+    fn new(
+        host_port: String,
+        interval: Duration,
+        errors: Arc<SendErrors>,
+    ) -> (Self, Option<String>) {
+        let (conn, warning) = match UdpConn::open(&host_port) {
+            Ok(conn) => (Some(Arc::new(conn)), None),
+            Err(error) => (
+                None,
+                Some(format!("DogStatsD initial resolve failed: {error}")),
+            ),
         };
-        Self {
-            shared: Arc::new(UdpShared {
-                host_port,
-                interval,
-                state: Mutex::new(UdpState {
-                    conn,
-                    last_attempt: Instant::now(),
+        (
+            Self {
+                shared: Arc::new(UdpShared {
+                    host_port,
+                    interval,
+                    state: Mutex::new(UdpState {
+                        conn,
+                        last_attempt: Instant::now(),
+                    }),
+                    errors,
                 }),
-                errors,
-            }),
-        }
+            },
+            warning,
+        )
     }
 
     /// Returns the connection to send on and starts a refresh when one is due.
@@ -242,7 +249,7 @@ impl fmt::Debug for DogstatsdMetrics {
 impl DogstatsdMetrics {
     /// Connects with the production rotation interval (`UDP_ROTATION_INTERVAL`).
     pub fn connect(target: &DogstatsdTarget, tags: &ConstTags) -> io::Result<Self> {
-        Self::connect_with_rotation(target, tags, UDP_ROTATION_INTERVAL)
+        Self::connect_with_initial_warning(target, tags).map(|(metrics, _)| metrics)
     }
 
     /// Like `connect` with an explicit UDP rotation interval (tests use a short one).
@@ -252,22 +259,44 @@ impl DogstatsdMetrics {
         tags: &ConstTags,
         rotation: Duration,
     ) -> io::Result<Self> {
+        Self::connect_with_warning(target, tags, rotation).map(|(metrics, _)| metrics)
+    }
+
+    /// Keeps the initial DNS failure available until a logging subscriber exists.
+    pub fn connect_with_initial_warning(
+        target: &DogstatsdTarget,
+        tags: &ConstTags,
+    ) -> io::Result<(Self, Option<String>)> {
+        Self::connect_with_warning(target, tags, UDP_ROTATION_INTERVAL)
+    }
+
+    fn connect_with_warning(
+        target: &DogstatsdTarget,
+        tags: &ConstTags,
+        rotation: Duration,
+    ) -> io::Result<(Self, Option<String>)> {
         let errors = Arc::new(SendErrors::default());
+        let mut warning = None;
         let builder = match target {
-            DogstatsdTarget::Udp { host_port } => StatsdClient::builder(
-                "",
-                RotatingUdpSink::new(host_port.clone(), rotation, Arc::clone(&errors)),
-            ),
+            DogstatsdTarget::Udp { host_port } => {
+                let (sink, initial_warning) =
+                    RotatingUdpSink::new(host_port.clone(), rotation, Arc::clone(&errors));
+                warning = initial_warning;
+                StatsdClient::builder("", sink)
+            }
             DogstatsdTarget::Unix { path } => {
                 let socket = UnixDatagram::unbound()?;
                 socket.set_nonblocking(true)?;
                 StatsdClient::builder("", UnixMetricSink::from(path, socket))
             }
         };
-        Ok(Self {
-            client: Self::finish(builder, tags, &errors),
-            errors,
-        })
+        Ok((
+            Self {
+                client: Self::finish(builder, tags, &errors),
+                errors,
+            },
+            warning,
+        ))
     }
 
     fn finish(

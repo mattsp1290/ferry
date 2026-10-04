@@ -179,7 +179,8 @@ fn rule_3_urls_must_be_https_without_userinfo() {
         "userinfo leaked into the message"
     );
 
-    let found = violations(&config("not a url", ok, ok));
+    let found = violations(&config("https://user:fake-secret@[invalid", ok, ok));
+    assert!(found.iter().all(|message| !message.contains("fake-secret")));
     assert_eq!(found.len(), 1, "{found:?}");
     assert!(found[0].contains("forgejo.url"));
 }

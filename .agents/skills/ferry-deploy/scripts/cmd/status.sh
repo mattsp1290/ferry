@@ -5,6 +5,9 @@ source "$SKILL_DIR/scripts/lib/remote.sh"
 report=$(remote_run status)
 printf '%s' "$report" | jq -r '"release: \(.status.info.status) revision: \(.status.version)", "image.digest: \(.values.image.digest)", "image.version: \(.values.image.version)", (.pods.items[] | "pod: \(.metadata.name) uid: \(.metadata.uid) phase: \(.status.phase) readiness: \([.status.conditions[]? | select(.type == "Ready") | .status][0] // "Unknown") restarts: \([.status.containerStatuses[]?.restartCount] | add // 0) node: \(.spec.nodeName)")'
 state=$(printf '%s' "$report" | jq -r '.status.info.status')
+if [ -f "$CFG/state/secret-restart-pending" ]; then
+    printf 'credentials: changed since the pod started; run deploy restart\n'
+fi
 case "$state" in
     pending-*|failed)
         revision=$(printf '%s' "$report" | jq -r '[.history[] | select(.status == "deployed" or .status == "superseded")] | sort_by(.revision | tonumber) | last | .revision // empty')
@@ -15,6 +18,3 @@ case "$state" in
         fi ;;
 esac
 if [ -f "$CFG/state/deployments.jsonl" ]; then printf 'local log: %s\n' "$(tail -n 1 "$CFG/state/deployments.jsonl")"; fi
-if [ -d "$CFG/state/gitops" ]; then
-    printf 'deploy key: Phase B installation status is not available in this workstation workflow\n'
-fi

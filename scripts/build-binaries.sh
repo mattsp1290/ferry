@@ -14,7 +14,7 @@ export FERRY_GIT_SHA
 # The .2.36 suffix is the glibc version of Debian bookworm, the base image.
 # Change it together with the base image distribution.
 target=x86_64-unknown-linux-gnu.2.36
-cargo zigbuild --release --target "$target"
+cargo zigbuild --locked --release --target "$target"
 
 mkdir -p dist/linux-amd64
 cp target/x86_64-unknown-linux-gnu/release/ferry dist/linux-amd64/ferry

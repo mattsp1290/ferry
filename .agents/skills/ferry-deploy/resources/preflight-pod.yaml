@@ -127,7 +127,7 @@
             "name": "sockets",
             "hostPath": {
               "path": "@SOCKET_PATH@",
-              "type": "DirectoryOrCreate"
+              "type": "Directory"
             }
           }
         ]
