@@ -129,7 +129,7 @@ Requirements: `git`, and `git-lfs` when any entry has `lfs = true`.
 ```sh
 cargo build --release
 # Put the Forgejo token in a 0600 file outside the repository, then:
-FERRY_FORGEJO_TOKEN_FILE=~/.config/ferry/forgejo-token \
+FERRY_FORGEJO_TOKEN_FILE=~/.local/config/ferry/secrets/forgejo-token \
 FERRY_LOG_FORMAT=text \
   target/release/ferry sync --once --config my-ferry.toml
 ```
@@ -173,6 +173,8 @@ FERRY_TEST_LFS=1 cargo test --test git_mirror   # LFS cases; needs git-lfs
 ignored by default; its header lists the environment it needs.
 
 ## Deployment
+
+Use the [ferry-deploy skill](.agents/skills/ferry-deploy/SKILL.md), with environment configuration outside git at `~/.local/config/ferry/` by default.
 
 - `charts/ferry` is the Helm chart: one replica, a cache volume, no Service.
 - `docker/` and `scripts/` build the runtime image.

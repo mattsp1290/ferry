@@ -16,7 +16,7 @@
 //! | `FERRY_LIVE_FORGEJO_OWNER` | Forgejo user or organization that receives the mirror |
 //! | `FERRY_FORGEJO_TOKEN_FILE` | Forgejo token file |
 //! | `FERRY_GITHUB_TOKEN_FILE` | GitHub token file (optional for a public repository) |
-//! | `FERRY_LIVE_FORGEJO_URL` | optional, default `https://git.birb.homes` |
+//! | `FERRY_LIVE_FORGEJO_URL` | required |
 //! | `FERRY_LIVE_FORGEJO_USER` | optional, default `ferry`: the username paired with the token |
 //! | `FERRY_LIVE_FORGEJO_NAME` | optional: reuse this destination instead of a new `ferry-acceptance-<random>` |
 //!
@@ -113,7 +113,7 @@ async fn mirrors_a_real_repository_with_lfs() {
         },
         github: GithubConfig::default(),
         forgejo: ForgejoConfig {
-            url: optional("FERRY_LIVE_FORGEJO_URL", "https://git.birb.homes"),
+            url: required("FERRY_LIVE_FORGEJO_URL"),
             username: optional("FERRY_LIVE_FORGEJO_USER", "ferry"),
         },
         health: HealthConfig::default(),

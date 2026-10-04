@@ -20,11 +20,12 @@ Additional checks for the areas they cover:
 
 | Area | Command | Needs |
 |---|---|---|
+| Deployment skill | `.agents/skills/ferry-deploy/tests/run.sh` | workstation tools listed by the skill |
 | LFS mirroring | `FERRY_TEST_LFS=1 cargo test --test git_mirror` | `git-lfs` |
 | Chart | `helm lint charts/ferry --set image.repository=x --set image.digest=sha256:0 && scripts/check-chart.sh` | `helm` |
 | Cross-build | `scripts/build-binaries.sh` | `zig`, `cargo-zigbuild` |
 | Live acceptance | `cargo test --test live_acceptance -- --ignored` | real tokens, LAN; see the test's header |
-| Secret hygiene | `git grep -nE 'ghp_\|github_pat_\|-----BEGIN' -- ':!AGENTS.md' ':!.agents'` returns nothing | — |
+| Secret hygiene | `git grep -nE 'ghp_\|github_pat_\|-----BEGIN' -- ':!AGENTS.md'` returns nothing | — |
 
 Without `FERRY_TEST_LFS=1` the LFS cases print a skip line instead of running.
 
@@ -113,3 +114,5 @@ work to `main` without it unless Matt decides otherwise.
 - Exit codes: `0` success, `1` runtime failure, `2` configuration or usage
   error.
 - Tests never touch real GitHub or Forgejo unless they are `#[ignore]`d.
+
+Deployment goes through `.agents/skills/ferry-deploy/SKILL.md`.

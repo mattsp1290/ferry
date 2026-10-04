@@ -1,0 +1,137 @@
+{
+  "apiVersion": "v1",
+  "kind": "List",
+  "items": [
+    {
+      "apiVersion": "v1",
+      "kind": "PersistentVolumeClaim",
+      "metadata": {
+        "name": "@NAME@"
+      },
+      "spec": {
+        "accessModes": [
+          "ReadWriteOnce"
+        ],
+        "storageClassName": "@STORAGE_CLASS@",
+        "resources": {
+          "requests": {
+            "storage": "1Gi"
+          }
+        }
+      }
+    },
+    {
+      "apiVersion": "v1",
+      "kind": "Pod",
+      "metadata": {
+        "name": "@NAME@"
+      },
+      "spec": {
+        "restartPolicy": "Never",
+        "automountServiceAccountToken": false,
+        "nodeSelector": {},
+        "securityContext": {
+          "fsGroup": 10001,
+          "seccompProfile": {
+            "type": "RuntimeDefault"
+          }
+        },
+        "containers": [
+          {
+            "name": "preflight",
+            "image": "@IMAGE@",
+            "command": [
+              "sh",
+              "-c",
+              "@PROBE@"
+            ],
+            "securityContext": {
+              "runAsNonRoot": true,
+              "runAsUser": 10001,
+              "runAsGroup": 10001,
+              "readOnlyRootFilesystem": true,
+              "allowPrivilegeEscalation": false,
+              "capabilities": {
+                "drop": [
+                  "ALL"
+                ]
+              }
+            },
+            "env": [
+              {
+                "name": "EXPECTED_COMMIT",
+                "value": "@VERSION@"
+              },
+              {
+                "name": "FORGEJO_URL",
+                "value": "@FORGEJO_URL@"
+              },
+              {
+                "name": "AGENT_SERVICE",
+                "value": "@AGENT_SERVICE@"
+              },
+              {
+                "name": "GIT_TERMINAL_PROMPT",
+                "value": "0"
+              },
+              {
+                "name": "GIT_CONFIG_GLOBAL",
+                "value": "/dev/null"
+              },
+              {
+                "name": "GIT_CONFIG_NOSYSTEM",
+                "value": "1"
+              }
+            ],
+            "volumeMounts": [
+              {
+                "name": "credentials",
+                "mountPath": "/var/run/secrets/ferry",
+                "readOnly": true
+              },
+              {
+                "name": "cache",
+                "mountPath": "/var/lib/ferry"
+              },
+              {
+                "name": "tmp",
+                "mountPath": "/tmp"
+              },
+              {
+                "name": "sockets",
+                "mountPath": "/var/run/datadog",
+                "readOnly": true
+              }
+            ]
+          }
+        ],
+        "volumes": [
+          {
+            "name": "credentials",
+            "secret": {
+              "secretName": "@SECRET@",
+              "defaultMode": 288
+            }
+          },
+          {
+            "name": "cache",
+            "persistentVolumeClaim": {
+              "claimName": "@NAME@"
+            }
+          },
+          {
+            "name": "tmp",
+            "emptyDir": {}
+          },
+          {
+            "name": "sockets",
+            "hostPath": {
+              "path": "@SOCKET_PATH@",
+              "type": "DirectoryOrCreate"
+            }
+          }
+        ]
+      }
+    }
+  ]
+}
