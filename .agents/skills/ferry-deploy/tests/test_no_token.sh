@@ -6,9 +6,9 @@ stubs_init
 trap 'rm -rf "$STUB_ROOT"' EXIT
 for command in check publish preflight rollout verify; do
   if [ "$command" = check ]; then
-    bash "$skill/scripts/deploy.sh" check --forgejo > "$STUB_ROOT/$command.out" 2>&1
+    bash "$skill/scripts/deploy.sh" check --forgejo > "$STUB_ROOT/$command.out" 2>&1 || { cat "$STUB_ROOT/$command.out" >&2; exit 1; }
   else
-    bash "$skill/scripts/deploy.sh" "$command" > "$STUB_ROOT/$command.out" 2>&1
+    bash "$skill/scripts/deploy.sh" "$command" > "$STUB_ROOT/$command.out" 2>&1 || { cat "$STUB_ROOT/$command.out" >&2; exit 1; }
   fi
 done
 python3 - "$STUB_ROOT" "$skill" <<'PY'
