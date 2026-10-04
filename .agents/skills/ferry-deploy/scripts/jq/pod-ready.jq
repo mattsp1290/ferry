@@ -1,0 +1,1 @@
+. as $r | ($r.values.nodeSelector // {} | to_entries) as $selector | ($r.pods.items | length == 1) and ($r.pods.items[0] | .status.phase == "Running" and any(.status.conditions[]?; .type == "Ready" and .status == "True")) and any($r.nodes.items[]?; .metadata.name == $r.pods.items[0].spec.nodeName and (.metadata.labels as $labels | all($selector[]; $labels[.key] == .value)))

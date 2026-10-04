@@ -1,0 +1,115 @@
+{{- include "ferry.validate" . -}}
+{{- $image := printf "%s@%s" .Values.image.repository .Values.image.digest -}}
+{{- $transport := .Values.datadog.transport -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "ferry.fullname" . }}
+  labels:
+    {{- include "ferry.labels" . | nindent 4 }}
+    tags.datadoghq.com/service: ferry
+    tags.datadoghq.com/env: {{ .Values.datadog.env | quote }}
+    tags.datadoghq.com/version: {{ include "ferry.version" . | quote }}
+spec:
+  # One replica only: the cache PVC is ReadWriteOnce and two syncs of one
+  # repository must never run at once. Not configurable on purpose.
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "ferry.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        ad.datadoghq.com/ferry.logs: '[{"source":"ferry","service":"ferry"}]'
+      labels:
+        {{- include "ferry.selectorLabels" . | nindent 8 }}
+        tags.datadoghq.com/service: ferry
+        tags.datadoghq.com/env: {{ .Values.datadog.env | quote }}
+        tags.datadoghq.com/version: {{ include "ferry.version" . | quote }}
+    spec:
+      serviceAccountName: {{ include "ferry.fullname" . }}
+      automountServiceAccountToken: false
+      # Shutdown budget: scheduler grace 25 + cancellation grace 12 + reap 2 + flush 5 = 44 seconds.
+      terminationGracePeriodSeconds: 50
+      securityContext:
+        {{- include "ferry.podSecurityContext" . | nindent 8 }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if .Values.cache.fixPermissions }}
+      initContainers:
+        {{- include "ferry.fixPermissionsContainer" . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: ferry
+          image: {{ $image | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- include "ferry.containerSecurityContext" . | nindent 12 }}
+          env:
+            {{- if .Values.allowInsecureUrls }}
+            - name: FERRY_ALLOW_INSECURE_URLS
+              value: "1"
+            {{- end }}
+            - name: FERRY_CONFIG
+              value: /etc/ferry/ferry.toml
+            - name: FERRY_FORGEJO_TOKEN_FILE
+              value: /var/run/secrets/ferry/forgejo-token
+            - name: FERRY_GITHUB_TOKEN_FILE
+              value: /var/run/secrets/ferry/github-token
+            - name: DD_SERVICE
+              value: ferry
+            - name: DD_ENV
+              value: {{ .Values.datadog.env | quote }}
+            - name: DD_VERSION
+              value: {{ include "ferry.version" . | quote }}
+            {{- if eq $transport "service" }}
+            - name: DD_DOGSTATSD_URL
+              value: {{ printf "udp://%s:8125" .Values.datadog.agentService | quote }}
+            - name: DD_TRACE_AGENT_URL
+              value: {{ printf "http://%s:8126" .Values.datadog.agentService | quote }}
+            {{- else if eq $transport "socket" }}
+            - name: DD_DOGSTATSD_URL
+              value: unix:///var/run/datadog/dsd.socket
+            - name: DD_TRACE_AGENT_URL
+              value: unix:///var/run/datadog/apm.socket
+            {{- end }}
+          ports:
+            - name: health
+              containerPort: 8080
+              protocol: TCP
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            periodSeconds: 10
+            failureThreshold: 30
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            periodSeconds: 30
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 8080
+            periodSeconds: 10
+          {{- with .Values.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - name: config
+              mountPath: /etc/ferry
+              readOnly: true
+            {{- include "ferry.runtimeMounts" . | nindent 12 }}
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "ferry.fullname" . }}
+        {{- include "ferry.runtimeVolumes" . | nindent 8 }}

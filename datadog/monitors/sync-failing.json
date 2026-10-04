@@ -1,0 +1,22 @@
+{
+  "name": "[ferry] Repository {{repo.name}} sync keeps failing",
+  "type": "metric alert",
+  "query": "min(last_10m):min:ferry.repo.consecutive_failures{service:ferry} by {repo} >= 3",
+  "message": "{{#is_alert}}The last 3 or more consecutive sync attempts for {{repo.name}} failed. With default settings this fires about 25 minutes after the first failure.\n\nFirst check: open the \"Ferry: GitHub to Forgejo mirror\" dashboard, filter `repo` to {{repo.name}}, and read the error kinds widget. Then search logs with `service:ferry status:error @repo:{{repo.name}}` for the failing step.\n\nIf the error kind is `dest_unmanaged`, the `ferry-mirror` topic was removed from the Forgejo repository. That is the per-repository stop switch: ferry never writes to a repository without that topic. Restore the topic in the Forgejo UI and restart the ferry pod to skip the backoff wait (the next attempt can otherwise be up to 60 minutes away).{{/is_alert}}\n\n{{#is_recovery}}{{repo.name}} synced successfully; the failure streak is cleared.{{/is_recovery}}",
+  "tags": [
+    "service:ferry",
+    "managed-by:ferry-repo"
+  ],
+  "priority": 2,
+  "options": {
+    "thresholds": {
+      "critical": 3
+    },
+    "notify_no_data": false,
+    "notify_audit": false,
+    "include_tags": true,
+    "require_full_window": false,
+    "renotify_interval": 0,
+    "evaluation_delay": 60
+  }
+}

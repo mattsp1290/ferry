@@ -1,0 +1,17 @@
+# The skill supplies image.repository, image.digest and image.version.
+config:
+  forgejo:
+    url: https://git.example.internal
+    username: ferry
+  repos:
+    - github: example-owner/example-repository
+      forgejo: example-owner/example-repository
+      adopt: false
+      lfs: false
+      actions: true
+cache:
+  storageClass: local-path
+  size: 20Gi
+datadog:
+  env: production
+  transport: none

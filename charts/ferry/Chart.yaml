@@ -1,0 +1,7 @@
+apiVersion: v2
+name: ferry
+description: Mirrors an allowlist of GitHub repositories into Forgejo.
+type: application
+version: 0.1.0
+# The crate version. Used as the default for image.version.
+appVersion: "0.1.0"

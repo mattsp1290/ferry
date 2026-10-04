@@ -1,0 +1,23 @@
+{
+  "name": "[ferry] Worker is not reporting a heartbeat",
+  "type": "metric alert",
+  "query": "sum(last_10m):sum:ferry.heartbeat{service:ferry} < 1",
+  "message": "{{#is_alert}}`ferry.heartbeat` reported nothing (sum below 1) for 10 minutes. The ferry worker is down, wedged (its scheduler loop stopped ticking, so liveness fails), or cannot reach the Datadog Agent. No repository is being mirrored while this lasts, and the per-repository stale monitor does not cover a dead worker.\n\nFirst check: `kubectl get pods` for the ferry pod, then its logs and `/healthz`. If the pod is healthy, check DogStatsD connectivity to the Datadog Agent. The heartbeat widget on the \"Ferry: GitHub to Forgejo mirror\" dashboard shows when reporting stopped.{{/is_alert}}\n\n{{#is_no_data}}Datadog has received no `ferry.heartbeat` datapoints for 10 minutes. Treat this as a dead or unreachable ferry worker. First check: `kubectl get pods` for the ferry pod, then its logs and `/healthz`. If the pod is healthy, check DogStatsD connectivity to the Datadog Agent.{{/is_no_data}}\n\n{{#is_recovery}}Ferry heartbeats are arriving again.{{/is_recovery}}",
+  "tags": [
+    "service:ferry",
+    "managed-by:ferry-repo"
+  ],
+  "priority": 2,
+  "options": {
+    "thresholds": {
+      "critical": 1
+    },
+    "notify_no_data": true,
+    "no_data_timeframe": 10,
+    "notify_audit": false,
+    "include_tags": true,
+    "require_full_window": false,
+    "renotify_interval": 0,
+    "evaluation_delay": 60
+  }
+}

@@ -1,0 +1,28 @@
+{{- if .Values.preflight.name -}}
+{{- include "ferry.validate" . -}}
+{{- $name := .Values.preflight.name -}}
+{{- $context := dict "Values" .Values "Chart" .Chart "Release" .Release "cacheClaim" $name -}}
+{{- $labels := dict "ferry-deploy-preflight" $name -}}
+{{- $image := printf "%s@%s" .Values.image.repository .Values.image.digest -}}
+{{- $env := list
+  (dict "name" "EXPECTED_COMMIT" "value" (include "ferry.version" .))
+  (dict "name" "FORGEJO_URL" "value" (printf "%s/%s.git" (trimSuffix "/" .Values.config.forgejo.url) (first .Values.config.repos).forgejo))
+  (dict "name" "AGENT_SERVICE" "value" .Values.datadog.agentService)
+  (dict "name" "GIT_TERMINAL_PROMPT" "value" "0")
+  (dict "name" "GIT_CONFIG_GLOBAL" "value" "/dev/null")
+  (dict "name" "GIT_CONFIG_NOSYSTEM" "value" "1") -}}
+{{- $container := dict "name" "preflight" "image" $image "imagePullPolicy" .Values.image.pullPolicy
+  "command" (list "sh" "-c" .Values.preflight.probe)
+  "securityContext" (include "ferry.containerSecurityContext" . | fromYaml)
+  "env" $env "volumeMounts" (include "ferry.runtimeMounts" . | fromYamlArray) -}}
+{{- $spec := dict "restartPolicy" "Never" "automountServiceAccountToken" false
+  "nodeSelector" .Values.nodeSelector "securityContext" (include "ferry.podSecurityContext" . | fromYaml)
+  "containers" (list $container) "volumes" (include "ferry.runtimeVolumes" $context | fromYamlArray) -}}
+{{- if .Values.cache.fixPermissions -}}
+{{- $_ := set $spec "initContainers" (include "ferry.fixPermissionsContainer" . | fromYamlArray) -}}
+{{- end -}}
+{{- $pod := dict "apiVersion" "v1" "kind" "Pod" "metadata" (dict "name" $name "labels" $labels) "spec" $spec -}}
+{{- $pvc := dict "apiVersion" "v1" "kind" "PersistentVolumeClaim" "metadata" (dict "name" $name "labels" $labels)
+  "spec" (dict "accessModes" (list "ReadWriteOnce") "storageClassName" .Values.cache.storageClass "resources" (dict "requests" (dict "storage" "1Gi"))) -}}
+{{- dict "apiVersion" "v1" "kind" "List" "items" (list $pvc $pod) | toJson -}}
+{{- end -}}

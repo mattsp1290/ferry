@@ -1,0 +1,1 @@
+.status.info.status == "deployed"

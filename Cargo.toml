@@ -1,0 +1,58 @@
+[package]
+name = "ferry"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.90"
+description = "Mirrors an allowlist of GitHub repositories into Forgejo"
+license = "MIT"
+repository = "https://github.com/mattsp1290/ferry"
+publish = false
+
+[[bin]]
+name = "ferry"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+async-trait = "0.1"
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
+cadence = "1.8"
+clap = { version = "4.6", features = ["derive"] }
+datadog-opentelemetry = "0.5.2"
+fastrand = "2"
+nix = { version = "0.31", features = ["signal"] }
+# The OpenTelemetry versions follow datadog-opentelemetry, not "latest".
+# See AGENTS.md before bumping any of them.
+opentelemetry = "0.32"
+opentelemetry_sdk = "0.32"
+reqwest = { version = "0.13", features = ["json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.11"
+tempfile = "3"
+thiserror = "2"
+tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "process", "signal", "time", "fs", "sync", "net", "io-util"] }
+tokio-util = "0.7"
+toml = "1.1"
+tracing = "0.1"
+tracing-opentelemetry = "0.33"
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
+url = "2"
+
+[dev-dependencies]
+opentelemetry_sdk = { version = "0.32", features = ["testing"] }
+tokio = { version = "1.53", features = ["test-util"] }
+toml = "1.1"
+# `ServiceExt::oneshot` drives the health router under a paused clock.
+tower = { version = "0.5", features = ["util"] }
+wiremock = "0.6"
+
+[profile.release]
+lto = "thin"
+strip = true
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = "deny"
